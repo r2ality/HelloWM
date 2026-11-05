@@ -3,7 +3,7 @@ mod desktop;
 
 use config::{Config, KeybindConfig, WidgetConfig};
 use desktop::{Desktop, IconKind};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -14,7 +14,7 @@ use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{
     Atom, AtomEnum, BackPixmap, ButtonIndex, ChangeGCAux, ChangeWindowAttributesAux, ClientMessageEvent, ImageFormat,
     ConfigWindow, CoordMode, CreateGCAux, CreateWindowAux, EventMask, Gcontext, GrabMode,
-    InputFocus, KeyButMask, MapState, ModMask, Pixmap, Point, PropMode, Rectangle, StackMode, Window, GrabStatus,
+    Allow, InputFocus, KeyButMask, MapState, ModMask, Pixmap, Point, PropMode, Rectangle, StackMode, Window, GrabStatus,
     WindowClass,
 };
 use x11rb::{CURRENT_TIME, NONE};
@@ -27,11 +27,14 @@ const START_BUTTON_WIDTH: i32 = 60;
 const PANEL_PADDING: i32 = 10;
 const TRAY_ICON_SIZE: i32 = 22;
 const NETWORK_ICON_WIDTH: i32 = 26;
-const CLIENT_BORDER: u32 = 2;
+const CLIENT_BORDER: u32 = 0;
 const TASK_ICON_SIZE: u16 = 28;
 const CLOCK_WIDTH: i32 = 112;
 const TITLEBAR_HEIGHT: u16 = 30;
 const DECORATION_BUTTON_WIDTH: i32 = 40;
+const DESKTOP_MENU_WIDTH: u16 = 224;
+const DESKTOP_MENU_ITEM_HEIGHT: i32 = 30;
+const DESKTOP_MENU_PADDING: i32 = 4;
 
 #[derive(Clone, Copy)]
 struct Palette {
@@ -70,6 +73,17 @@ struct AboutWindow {
     width: u16,
     height: u16,
     lines: Vec<String>,
+}
+
+#[derive(Clone)]
+struct DesktopContextMenu {
+    window: Window,
+    icon_path: PathBuf,
+    is_computer: bool,
+    options: Vec<String>,
+    width: u16,
+    height: u16,
+    hovered: Option<usize>,
 }
 
 #[derive(Clone)]
@@ -118,6 +132,7 @@ struct Atoms {
     net_wm_strut_partial: Atom,
     wm_protocols: Atom,
     wm_delete_window: Atom,
+    wm_transient_for: Atom,
     wm_name: Atom,
     tray_selection: Atom,
     tray_opcode: Atom,
@@ -134,6 +149,7 @@ struct Atoms {
     net_wm_icon: Atom,
     net_wm_state: Atom,
     net_wm_state_hidden: Atom,
+    net_wm_state_modal: Atom,
     net_wm_state_maximized_vert: Atom,
     net_wm_state_maximized_horz: Atom,
     wm_state: Atom,
@@ -167,6 +183,7 @@ impl Atoms {
             net_wm_strut_partial: intern_atom(conn, "_NET_WM_STRUT_PARTIAL")?,
             wm_protocols: intern_atom(conn, "WM_PROTOCOLS")?,
             wm_delete_window: intern_atom(conn, "WM_DELETE_WINDOW")?,
+            wm_transient_for: intern_atom(conn, "WM_TRANSIENT_FOR")?,
             wm_name: intern_atom(conn, "WM_NAME")?,
             tray_selection: intern_atom(conn, &format!("_NET_SYSTEM_TRAY_S{screen_num}"))?,
             tray_opcode: intern_atom(conn, "_NET_SYSTEM_TRAY_OPCODE")?,
@@ -183,6 +200,7 @@ impl Atoms {
             net_wm_icon: intern_atom(conn, "_NET_WM_ICON")?,
             net_wm_state: intern_atom(conn, "_NET_WM_STATE")?,
             net_wm_state_hidden: intern_atom(conn, "_NET_WM_STATE_HIDDEN")?,
+            net_wm_state_modal: intern_atom(conn, "_NET_WM_STATE_MODAL")?,
             net_wm_state_maximized_vert: intern_atom(conn, "_NET_WM_STATE_MAXIMIZED_VERT")?,
             net_wm_state_maximized_horz: intern_atom(conn, "_NET_WM_STATE_MAXIMIZED_HORZ")?,
             wm_state: intern_atom(conn, "WM_STATE")?,
@@ -210,6 +228,7 @@ struct Manager {
     desktop_window: Option<Window>,
     desktop_root_pixmap: Option<Pixmap>,
     desktop_icon_windows: Vec<(PathBuf, Window)>,
+    desktop_context_menu: Option<DesktopContextMenu>,
     desktop_icon_sources: HashMap<IconKind, RgbaImage>,
     desktop: Option<Desktop>,
     decorations: HashMap<Window, Window>,
@@ -235,9 +254,14 @@ struct Manager {
     desktop_drag_start: Option<(usize, i16, i16, i16, i16)>,
     desktop_selection_start: Option<(i16, i16)>,
     desktop_selection_rect: Option<(i16, i16, i16, i16)>,
+    /// Four one-pixel child windows form the rubber-band outline. Moving these
+    /// windows lets X11 restore the old desktop pixels without manual painting.
+    desktop_selection_windows: [Window; 4],
     last_desktop_scan: Instant,
     clients: Vec<Window>,
     minimized: Vec<Window>,
+    transient_for: HashMap<Window, Window>,
+    modal_transients: HashSet<Window>,
     maximized_restore: HashMap<Window, WindowGeometry>,
     client_icons: HashMap<Window, Pixmap>,
     active: Option<Window>,
@@ -348,6 +372,32 @@ impl Manager {
             }
         }
 
+        // Rubber-band selection is rendered as four thin child windows rather
+        // than drawing onto the desktop pixmap. The X server exposes and
+        // repaints the old locations automatically when these lines move.
+        let mut desktop_selection_windows = [NONE; 4];
+        if let Some(desktop_parent) = desktop_window {
+            for slot in &mut desktop_selection_windows {
+                let line = conn.generate_id()?;
+                conn.create_window(
+                    screen.root_depth,
+                    line,
+                    desktop_parent,
+                    0,
+                    0,
+                    1,
+                    1,
+                    0,
+                    WindowClass::INPUT_OUTPUT,
+                    screen.root_visual,
+                    &CreateWindowAux::new()
+                        .background_pixel(initial_palette.accent)
+                        .override_redirect(1u32),
+                )?.check()?;
+                *slot = line;
+            }
+        }
+
         let panel = conn.generate_id()?;
         let panel_y = screen_height.saturating_sub(panel_height) as i16;
         conn.create_window(
@@ -424,6 +474,7 @@ impl Manager {
             desktop_window,
             desktop_root_pixmap,
             desktop_icon_windows: Vec::new(),
+            desktop_context_menu: None,
             desktop_icon_sources,
             desktop: desktop_state,
             decorations: HashMap::new(),
@@ -449,9 +500,12 @@ impl Manager {
             desktop_drag_start: None,
             desktop_selection_start: None,
             desktop_selection_rect: None,
+            desktop_selection_windows,
             last_desktop_scan: Instant::now(),
             clients: Vec::new(),
             minimized: Vec::new(),
+            transient_for: HashMap::new(),
+            modal_transients: HashSet::new(),
             maximized_restore: HashMap::new(),
             client_icons: HashMap::new(),
             active: None,
@@ -589,6 +643,7 @@ impl Manager {
             self.atoms.net_wm_action_close,
             self.atoms.net_wm_state,
             self.atoms.net_wm_state_hidden,
+            self.atoms.net_wm_state_modal,
             self.atoms.net_wm_state_maximized_vert,
             self.atoms.net_wm_state_maximized_horz,
         ];
@@ -872,7 +927,9 @@ impl Manager {
                 }
             }
             Event::MotionNotify(ev) => {
-                if self.desktop_selection_start.is_some() {
+                if self.desktop_context_menu.as_ref().is_some_and(|menu| menu.window == ev.event) {
+                    self.update_desktop_context_menu_hover(ev.event_y)?;
+                } else if self.desktop_selection_start.is_some() {
                     self.handle_desktop_selection_motion(ev.root_x, ev.root_y)?;
                 } else if self.desktop_icon_windows.iter().any(|(_, window)| *window == ev.event) {
                     self.handle_desktop_motion(ev.root_x, ev.root_y)?;
@@ -887,15 +944,17 @@ impl Manager {
                     self.handle_key_press(ev.detail, ev.state)?;
                 }
             }
-            Event::EnterNotify(ev) => {
-                if self.clients.contains(&ev.event) {
-                    self.focus_window(ev.event)?;
-                }
+            Event::EnterNotify(_ev) => {
+                // Deliberately ignored: HelloWM is click-to-focus, not
+                // focus-follows-mouse. Moving across a window or popup must
+                // never change keyboard focus.
             }
             Event::Expose(ev) => {
                 if ev.count == 0 {
                     if ev.window == self.panel {
                         self.draw_panel()?;
+                    } else if self.desktop_context_menu.as_ref().is_some_and(|menu| menu.window == ev.window) {
+                        self.draw_desktop_context_menu()?;
                     } else if let Some(index) = self.desktop_icon_index(ev.window) {
                         self.draw_desktop_icon_window(index)?;
                     } else if self.about_window.as_ref().is_some_and(|about| about.window == ev.window) {
@@ -903,7 +962,8 @@ impl Manager {
                     } else if let Some(client) = self.decoration_client(ev.window) {
                         self.draw_client_decoration(client)?;
                     } else if self.desktop_window == Some(ev.window) {
-                        self.draw_desktop_selection_overlay()?;
+                        // The selection outline is made from separate X11 child
+                        // windows; the desktop parent must never repaint it.
                     }
                 }
             }
@@ -925,6 +985,13 @@ impl Manager {
                 {
                     self.draw_panel()?;
                     self.draw_client_decoration(ev.window)?;
+                } else if self.clients.contains(&ev.window)
+                    && (ev.atom == self.atoms.wm_transient_for || ev.atom == self.atoms.net_wm_state)
+                {
+                    self.refresh_transient_metadata(ev.window);
+                    if self.active == self.transient_for.get(&ev.window).copied() {
+                        self.focus_window(ev.window)?;
+                    }
                 } else if self.clients.contains(&ev.window) && ev.atom == self.atoms.net_wm_icon {
                     self.refresh_client_icon(ev.window)?;
                     self.draw_panel()?;
@@ -964,23 +1031,36 @@ impl Manager {
             Ok(geometry) => geometry,
             Err(_) => return Ok(()),
         };
+        let transient_parent = self.read_transient_for(window)
+            .filter(|parent| *parent != self.root && *parent != window && self.clients.contains(parent));
         let mut x = geometry.x as i32;
         let mut y = geometry.y as i32;
         let width = geometry.width.max(320);
         let height = geometry.height.max(180);
         if x == 0 && y == 0 {
-            x = ((self.screen_width as i32 - width as i32) / 2).max(12);
-            y = ((self.screen_height as i32 - self.panel_height as i32 - height as i32 - TITLEBAR_HEIGHT as i32) / 2).max(12);
+            if let Some(parent) = transient_parent {
+                if let Ok(parent_geometry) = self.conn.get_geometry(parent)?.reply() {
+                    x = parent_geometry.x as i32
+                        + (parent_geometry.width as i32 - width as i32) / 2;
+                    y = parent_geometry.y as i32
+                        + (parent_geometry.height as i32 - height as i32) / 2;
+                } else {
+                    x = ((self.screen_width as i32 - width as i32) / 2).max(12);
+                    y = ((self.screen_height as i32 - self.panel_height as i32 - height as i32) / 2).max(12);
+                }
+            } else {
+                x = ((self.screen_width as i32 - width as i32) / 2).max(12);
+                y = ((self.screen_height as i32 - self.panel_height as i32 - height as i32 - TITLEBAR_HEIGHT as i32) / 2).max(12);
+            }
         }
         x = x.clamp(0, self.screen_width.saturating_sub(120) as i32);
         y = (y + TITLEBAR_HEIGHT as i32).clamp(TITLEBAR_HEIGHT as i32, self.screen_height.saturating_sub(self.panel_height + 80) as i32);
 
-        let border = if self.active == Some(window) { self.palette.accent } else { self.palette.border };
         self.conn.change_window_attributes(
             window,
             &ChangeWindowAttributesAux::new()
-                .border_pixel(border)
-                .event_mask(EventMask::ENTER_WINDOW | EventMask::PROPERTY_CHANGE | EventMask::STRUCTURE_NOTIFY),
+                .border_pixel(self.palette.panel)
+                .event_mask(EventMask::PROPERTY_CHANGE | EventMask::STRUCTURE_NOTIFY),
         )?;
         self.conn.configure_window(
             window,
@@ -993,23 +1073,21 @@ impl Manager {
                 .stack_mode(StackMode::ABOVE),
         )?;
 
-        // Super+left drag moves a client; Super+right drag resizes it.
-        let drag_mask = EventMask::BUTTON_PRESS | EventMask::BUTTON_RELEASE | EventMask::POINTER_MOTION;
+        // Passive button grabs provide click-to-focus without pointer-enter
+        // focus. Button presses are replayed into the app after focus changes;
+        // holding Super turns left/right clicks into move/resize gestures.
+        let click_mask = EventMask::BUTTON_PRESS | EventMask::BUTTON_RELEASE | EventMask::POINTER_MOTION;
         for button in [ButtonIndex::M1, ButtonIndex::M3] {
-            let _ = self.conn.grab_button(
-                false,
-                window,
-                drag_mask,
-                GrabMode::ASYNC,
-                GrabMode::ASYNC,
-                NONE,
-                NONE,
-                button,
-                ModMask::M4,
-            );
+            if let Err(error) = self.conn.grab_button(
+                false, window, click_mask, GrabMode::SYNC, GrabMode::ASYNC,
+                NONE, NONE, button, ModMask::ANY,
+            )?.check() {
+                eprintln!("HelloWM: could not install click-to-focus grab on window {window}: {error}");
+            }
         }
 
         self.clients.push(window);
+        self.refresh_transient_metadata(window);
         self.set_client_allowed_actions(window)?;
         self.set_icccm_state(window, 1)?; // NormalState
         self.conn.map_window(window)?;
@@ -1034,6 +1112,9 @@ impl Manager {
         }
         self.clients.retain(|candidate| *candidate != window);
         self.minimized.retain(|candidate| *candidate != window);
+        self.transient_for.remove(&window);
+        self.modal_transients.remove(&window);
+        self.transient_for.retain(|_, parent| *parent != window);
         self.maximized_restore.remove(&window);
         if let Some(pixmap) = self.client_icons.remove(&window) {
             let _ = self.conn.free_pixmap(pixmap);
@@ -1064,24 +1145,56 @@ impl Manager {
         Ok(())
     }
 
+    fn read_transient_for(&self, window: Window) -> Option<Window> {
+        self.conn
+            .get_property(false, window, self.atoms.wm_transient_for, AtomEnum::WINDOW, 0, 1)
+            .ok()?
+            .reply()
+            .ok()?
+            .value32()?
+            .next()
+    }
+
+    fn refresh_transient_metadata(&mut self, window: Window) {
+        let parent = self.read_transient_for(window)
+            .filter(|parent| *parent != self.root && *parent != window && self.clients.contains(parent));
+        if let Some(parent) = parent {
+            self.transient_for.insert(window, parent);
+        } else {
+            self.transient_for.remove(&window);
+        }
+        if self.read_net_wm_states(window).contains(&self.atoms.net_wm_state_modal) {
+            self.modal_transients.insert(window);
+        } else {
+            self.modal_transients.remove(&window);
+        }
+    }
+
     fn focus_window(&mut self, window: Window) -> Result<(), Box<dyn Error>> {
         if !self.clients.contains(&window) || self.minimized.contains(&window) {
             return Ok(());
         }
-        self.set_icccm_state(window, 1)?;
-        let previous_active = self.active;
-        if let Some(previous) = previous_active {
-            if previous != window {
-                let _ = self.conn.change_window_attributes(
-                    previous,
-                    &ChangeWindowAttributesAux::new().border_pixel(self.palette.border),
-                );
+        // A live transient belongs above its parent. Prefer modal transients,
+        // but also protect older toolkits that set WM_TRANSIENT_FOR without
+        // publishing _NET_WM_STATE_MODAL (some native file choosers do this).
+        // Clicks directed at a parent are redirected to the dialog while it is open.
+        let transient_child = self.clients.iter().rev().copied().find(|candidate| {
+            self.transient_for.get(candidate) == Some(&window)
+                && self.modal_transients.contains(candidate)
+                && !self.minimized.contains(candidate)
+        }).or_else(|| {
+            self.clients.iter().rev().copied().find(|candidate| {
+                self.transient_for.get(candidate) == Some(&window)
+                    && !self.minimized.contains(candidate)
+            })
+        });
+        if let Some(dialog) = transient_child {
+            if dialog != window {
+                return self.focus_window(dialog);
             }
         }
-        self.conn.change_window_attributes(
-            window,
-            &ChangeWindowAttributesAux::new().border_pixel(self.palette.accent),
-        )?;
+        self.set_icccm_state(window, 1)?;
+        let previous_active = self.active;
         self.conn.configure_window(
             window,
             &x11rb::protocol::xproto::ConfigureWindowAux::new().stack_mode(StackMode::ABOVE),
@@ -1089,6 +1202,17 @@ impl Manager {
         self.conn.set_input_focus(InputFocus::POINTER_ROOT, window, CURRENT_TIME)?;
         if let Some(decoration) = self.decorations.get(&window).copied() {
             self.conn.configure_window(decoration, &x11rb::protocol::xproto::ConfigureWindowAux::new().stack_mode(StackMode::ABOVE))?;
+        }
+        // Keep modeless dialogs visually attached to their parent; modal ones
+        // are focused above, while all visible transients stay above the parent.
+        let children = self.transient_for.iter()
+            .filter_map(|(child, parent)| (*parent == window && !self.minimized.contains(child)).then_some(*child))
+            .collect::<Vec<_>>();
+        for child in children {
+            self.conn.configure_window(child, &x11rb::protocol::xproto::ConfigureWindowAux::new().stack_mode(StackMode::ABOVE))?;
+            if let Some(decoration) = self.decorations.get(&child).copied() {
+                self.conn.configure_window(decoration, &x11rb::protocol::xproto::ConfigureWindowAux::new().stack_mode(StackMode::ABOVE))?;
+            }
         }
         self.conn.change_property32(
             PropMode::REPLACE,
@@ -1343,6 +1467,13 @@ impl Manager {
         &mut self,
         ev: x11rb::protocol::xproto::ButtonPressEvent,
     ) -> Result<(), Box<dyn Error>> {
+        if self.desktop_context_menu.as_ref().is_some_and(|menu| menu.window == ev.event) {
+            self.handle_desktop_context_menu_button(ev)?;
+            return Ok(());
+        }
+        if self.desktop_context_menu.is_some() {
+            self.close_desktop_context_menu()?;
+        }
         if let Some(client) = self.decoration_client(ev.event) {
             self.handle_decoration_button(ev, client)?;
             return Ok(());
@@ -1393,8 +1524,9 @@ impl Manager {
         }
 
         if self.clients.contains(&ev.event) {
+            let modifier_drag = ev.state.contains(KeyButMask::MOD4) && (ev.detail == 1 || ev.detail == 3);
             self.focus_window(ev.event)?;
-            if ev.state.contains(KeyButMask::MOD4) && (ev.detail == 1 || ev.detail == 3) {
+            if modifier_drag {
                 if let Ok(geometry) = self.conn.get_geometry(ev.event)?.reply() {
                     self.drag = Some(DragState {
                         window: ev.event,
@@ -1407,6 +1539,18 @@ impl Manager {
                         start_height: geometry.height,
                     });
                 }
+                // This button press is consumed by HelloWM as a move/resize
+                // gesture; continue delivering pointer motion until release.
+                self.conn.allow_events(Allow::ASYNC_POINTER, CURRENT_TIME)?;
+            } else if self.active == Some(ev.event) {
+                // Click-to-focus: replay the original click into the application
+                // after setting keyboard focus. This avoids focus-follows-mouse
+                // stealing focus from file choosers and other transient dialogs.
+                self.conn.allow_events(Allow::REPLAY_POINTER, CURRENT_TIME)?;
+            } else {
+                // A modal/transient child owns focus instead of its parent;
+                // swallow clicks directed at the parent while that dialog is open.
+                self.conn.allow_events(Allow::ASYNC_POINTER, CURRENT_TIME)?;
             }
         }
         Ok(())
@@ -1417,6 +1561,201 @@ impl Manager {
             .find(|(_, icon_window)| *icon_window == window)
             .map(|(path, _)| path)?;
         self.desktop.as_ref()?.icons.iter().position(|icon| &icon.path == path)
+    }
+
+    fn show_desktop_icon_context_menu(
+        &mut self,
+        index: usize,
+        root_x: i16,
+        root_y: i16,
+    ) -> Result<(), Box<dyn Error>> {
+        self.close_desktop_context_menu()?;
+        let Some((icon_path, is_computer)) = self.desktop.as_ref()
+            .and_then(|desktop| desktop.icons.get(index))
+            .map(|icon| (icon.path.clone(), icon.kind == IconKind::Computer)) else {
+            return Ok(());
+        };
+        let options = if is_computer {
+            vec!["About computer".to_string(), "Hide from desktop".to_string()]
+        } else {
+            vec![
+                "Open".to_string(),
+                "Open containing folder".to_string(),
+                "Move to Trash".to_string(),
+            ]
+        };
+        let height = (DESKTOP_MENU_PADDING * 2
+            + options.len() as i32 * DESKTOP_MENU_ITEM_HEIGHT) as u16;
+        let x = (root_x as i32).clamp(
+            0,
+            (self.screen_width as i32 - DESKTOP_MENU_WIDTH as i32 - 2).max(0),
+        );
+        let y = (root_y as i32).clamp(
+            0,
+            (self.screen_height as i32 - self.panel_height as i32 - height as i32 - 2).max(0),
+        );
+        let window = self.conn.generate_id()?;
+        self.conn.create_window(
+            self.screen_depth,
+            window,
+            self.root,
+            x as i16,
+            y as i16,
+            DESKTOP_MENU_WIDTH,
+            height,
+            1,
+            WindowClass::INPUT_OUTPUT,
+            self.screen_visual,
+            &CreateWindowAux::new()
+                .background_pixel(self.palette.surface)
+                .border_pixel(self.palette.border)
+                .override_redirect(1u32)
+                .event_mask(EventMask::EXPOSURE | EventMask::BUTTON_PRESS | EventMask::POINTER_MOTION),
+        )?.check()?;
+        self.conn.map_window(window)?.check()?;
+        self.conn.configure_window(
+            window,
+            &x11rb::protocol::xproto::ConfigureWindowAux::new().stack_mode(StackMode::ABOVE),
+        )?;
+        self.desktop_context_menu = Some(DesktopContextMenu {
+            window,
+            icon_path,
+            is_computer,
+            options,
+            width: DESKTOP_MENU_WIDTH,
+            height,
+            hovered: None,
+        });
+        self.draw_desktop_context_menu()?;
+        Ok(())
+    }
+
+    fn close_desktop_context_menu(&mut self) -> Result<(), Box<dyn Error>> {
+        if let Some(menu) = self.desktop_context_menu.take() {
+            self.conn.destroy_window(menu.window)?;
+        }
+        Ok(())
+    }
+
+    fn update_desktop_context_menu_hover(&mut self, pointer_y: i16) -> Result<(), Box<dyn Error>> {
+        let Some(menu) = self.desktop_context_menu.as_mut() else { return Ok(()); };
+        let row_y = pointer_y as i32 - DESKTOP_MENU_PADDING;
+        let hovered = if row_y < 0 {
+            None
+        } else {
+            let index = (row_y / DESKTOP_MENU_ITEM_HEIGHT) as usize;
+            (index < menu.options.len()).then_some(index)
+        };
+        if hovered != menu.hovered {
+            menu.hovered = hovered;
+            self.draw_desktop_context_menu()?;
+        }
+        Ok(())
+    }
+
+    fn draw_desktop_context_menu(&self) -> Result<(), Box<dyn Error>> {
+        let Some(menu) = &self.desktop_context_menu else { return Ok(()); };
+        self.fill_rect_on(
+            menu.window,
+            0,
+            0,
+            menu.width as i32,
+            menu.height as i32,
+            self.palette.surface,
+        )?;
+        self.set_gc(self.palette.border, self.palette.surface)?;
+        self.conn.poly_rectangle(menu.window, self.gc, &[Rectangle {
+            x: 0,
+            y: 0,
+            width: menu.width.saturating_sub(1),
+            height: menu.height.saturating_sub(1),
+        }])?;
+        for (index, label) in menu.options.iter().enumerate() {
+            let y = DESKTOP_MENU_PADDING + index as i32 * DESKTOP_MENU_ITEM_HEIGHT;
+            let background = if menu.hovered == Some(index) {
+                self.palette.accent
+            } else {
+                self.palette.surface
+            };
+            self.fill_rect_on(
+                menu.window,
+                2,
+                y,
+                menu.width as i32 - 4,
+                DESKTOP_MENU_ITEM_HEIGHT,
+                background,
+            )?;
+            let foreground = if menu.hovered == Some(index) {
+                0x00ffffff
+            } else {
+                self.palette.text
+            };
+            self.draw_text_on(menu.window, label, 12, y + 20, foreground, background)?;
+        }
+        Ok(())
+    }
+
+    fn handle_desktop_context_menu_button(
+        &mut self,
+        ev: x11rb::protocol::xproto::ButtonPressEvent,
+    ) -> Result<(), Box<dyn Error>> {
+        if ev.detail != 1 {
+            self.close_desktop_context_menu()?;
+            return Ok(());
+        }
+        let Some(menu) = self.desktop_context_menu.clone() else { return Ok(()); };
+        let row_y = ev.event_y as i32 - DESKTOP_MENU_PADDING;
+        if row_y < 0 {
+            self.close_desktop_context_menu()?;
+            return Ok(());
+        }
+        let index = (row_y / DESKTOP_MENU_ITEM_HEIGHT) as usize;
+        if index >= menu.options.len() {
+            self.close_desktop_context_menu()?;
+            return Ok(());
+        }
+        self.close_desktop_context_menu()?;
+
+        if menu.is_computer {
+            match index {
+                0 => self.open_about()?,
+                1 => {
+                    if let Some(desktop) = &mut self.desktop {
+                        if let Err(error) = desktop.remove_icon(&menu.icon_path) {
+                            eprintln!("HelloWM: could not hide Computer icon: {error}");
+                        }
+                    }
+                    self.draw_desktop()?;
+                }
+                _ => {}
+            }
+            return Ok(());
+        }
+
+        match index {
+            0 => {
+                if let Some(desktop) = &self.desktop {
+                    if let Some(icon_index) = desktop.icons.iter().position(|icon| icon.path == menu.icon_path) {
+                        desktop.open_icon(icon_index);
+                    }
+                }
+            }
+            1 => {
+                if let Some(desktop) = &self.desktop {
+                    desktop.open_containing_folder(&menu.icon_path);
+                }
+            }
+            2 => {
+                if let Some(desktop) = &mut self.desktop {
+                    if let Err(error) = desktop.remove_icon(&menu.icon_path) {
+                        eprintln!("HelloWM: could not move desktop item to Trash: {error}");
+                    }
+                }
+                self.draw_desktop()?;
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     fn handle_desktop_icon_button(
@@ -1486,6 +1825,7 @@ impl Manager {
                     desktop.last_click = None;
                 }
                 self.draw_desktop()?;
+                self.show_desktop_icon_context_menu(index, ev.root_x, ev.root_y)?;
             }
             _ => {}
         }
@@ -1587,7 +1927,7 @@ impl Manager {
         let focused = self.active == Some(client);
         let background = if focused { self.palette.surface } else { self.palette.panel };
         self.fill_rect_on(decoration, 0, 0, width, height, background)?;
-        self.set_gc(if focused { self.palette.accent } else { self.palette.border }, background)?;
+        self.set_gc(self.palette.border, background)?;
         self.conn.poly_rectangle(decoration, self.gc, &[Rectangle { x: 0, y: 0, width: width.max(1) as u16, height: height as u16 }])?;
         let title = self.window_title(client).unwrap_or_else(|| "Application".into());
         let title_room = (width - (DECORATION_BUTTON_WIDTH * 3) - 28).max(0) / 9;
@@ -1666,11 +2006,10 @@ impl Manager {
         let bottom = start_y.max(root_y);
         let rect = (left, top, right, bottom);
         if self.desktop_selection_rect != Some(rect) {
-            self.clear_desktop_selection_outline()?;
             self.desktop_selection_rect = Some(rect);
             self.draw_desktop_selection_overlay()?;
 
-            let mut selected = std::collections::HashSet::new();
+            let mut selected = HashSet::new();
             if right - left > 3 || bottom - top > 3 {
                 if let Some(desktop) = &self.desktop {
                     for icon in &desktop.icons {
@@ -1708,31 +2047,39 @@ impl Manager {
     }
 
     fn clear_desktop_selection_outline(&self) -> Result<(), Box<dyn Error>> {
-        let Some(window) = self.desktop_window else { return Ok(()); };
-        if let Some((left, top, right, bottom)) = self.desktop_selection_rect {
-            let x = left.min(right);
-            let y = top.min(bottom);
-            let width = (right - left).unsigned_abs().max(1);
-            let height = (bottom - top).unsigned_abs().max(1);
-            self.conn.clear_area(false, window, x, y, width, height)?;
+        for window in self.desktop_selection_windows {
+            if window != NONE { self.conn.unmap_window(window)?; }
         }
         Ok(())
     }
 
     fn draw_desktop_selection_overlay(&self) -> Result<(), Box<dyn Error>> {
-        let Some(window) = self.desktop_window else { return Ok(()); };
-        if let Some((left, top, right, bottom)) = self.desktop_selection_rect {
-            let x = left.min(right);
-            let y = top.min(bottom);
-            let width = (right - left).unsigned_abs().max(1);
-            let height = (bottom - top).unsigned_abs().max(1);
-            self.set_gc(self.palette.accent, self.palette.panel)?;
-            self.conn.poly_rectangle(window, self.gc, &[Rectangle {
-                x,
-                y,
-                width,
-                height,
-            }])?;
+        let Some((left, top, right, bottom)) = self.desktop_selection_rect else { return Ok(()); };
+        let width = (right - left).unsigned_abs().max(1) as u32;
+        let height = (bottom - top).unsigned_abs().max(1) as u32;
+        let right_edge = left.saturating_add(width.saturating_sub(1) as i16);
+        let bottom_edge = top.saturating_add(height.saturating_sub(1) as i16);
+        // Four independent one-pixel windows avoid painting over the desktop
+        // or icon contents. Moving them lets the X server restore the pixels
+        // they uncover, instead of leaving a manually-drawn trail.
+        let segments = [
+            (left, top, width, 1_u32),
+            (left, bottom_edge, width, 1_u32),
+            (left, top, 1_u32, height),
+            (right_edge, top, 1_u32, height),
+        ];
+        for (window, (x, y, w, h)) in self.desktop_selection_windows.iter().copied().zip(segments) {
+            if window == NONE { continue; }
+            self.conn.configure_window(
+                window,
+                &x11rb::protocol::xproto::ConfigureWindowAux::new()
+                    .x(x as i32)
+                    .y(y as i32)
+                    .width(w)
+                    .height(h)
+                    .stack_mode(StackMode::ABOVE),
+            )?;
+            self.conn.map_window(window)?;
         }
         Ok(())
     }
@@ -1936,8 +2283,8 @@ impl Manager {
             )?;
         }
         if let Some(source) = self.desktop_icon_sources.get(&icon.kind) {
-            let image_x = 22_i32;
-            let image_y = 2_i32;
+            let image_x = (desktop::IconBounds::WIDTH - 48) / 2;
+            let image_y = 4_i32;
             let blended = self.composite_desktop_icon(
                 source,
                 icon.x.saturating_add(image_x as i16),
@@ -1966,10 +2313,10 @@ impl Manager {
                 x: (x + 15) as i16, y: (y + 6) as i16, width: 31, height: 41,
             }])?;
         }
-        let label = truncate_ascii(&icon.name, 11);
+        let label = truncate_ascii(&icon.name, 9);
         let text_x = ((desktop::IconBounds::WIDTH - label.len() as i32 * 9) / 2).max(1);
-        self.draw_transparent_text_on(drawable, &label, text_x + 1, y + 65, 0x00000000)?;
-        self.draw_transparent_text_on(drawable, &label, text_x, y + 64, 0x00ffffff)?;
+        self.draw_transparent_text_on(drawable, &label, text_x + 1, y + 71, 0x00000000)?;
+        self.draw_transparent_text_on(drawable, &label, text_x, y + 70, 0x00ffffff)?;
         Ok(())
     }
 
@@ -2317,8 +2664,10 @@ impl Manager {
         }
 
         for window in self.clients.clone() {
-            let border = if Some(window) == self.active { self.palette.accent } else { self.palette.border };
-            let _ = self.conn.change_window_attributes(window, &ChangeWindowAttributesAux::new().border_pixel(border));
+            let _ = self.conn.change_window_attributes(
+                window,
+                &ChangeWindowAttributesAux::new().border_pixel(self.palette.panel),
+            );
             self.refresh_client_icon(window)?;
         }
         self.init_widgets();
@@ -2501,6 +2850,14 @@ impl Manager {
             &self.config.theme,
         );
         self.start_image = refreshed_start_image;
+        for window in self.desktop_selection_windows {
+            if window != NONE {
+                self.conn.change_window_attributes(
+                    window,
+                    &ChangeWindowAttributesAux::new().background_pixel(self.palette.accent),
+                )?;
+            }
+        }
         self.conn.change_window_attributes(
             self.panel,
             &ChangeWindowAttributesAux::new().background_pixel(self.palette.panel),
@@ -2512,10 +2869,9 @@ impl Manager {
                 .background(self.palette.panel),
         )?;
         for window in self.clients.clone() {
-            let border = if Some(window) == self.active { self.palette.accent } else { self.palette.border };
             let _ = self.conn.change_window_attributes(
                 window,
-                &ChangeWindowAttributesAux::new().border_pixel(border),
+                &ChangeWindowAttributesAux::new().border_pixel(self.palette.panel),
             );
             let _ = self.refresh_client_icon(window);
         }
