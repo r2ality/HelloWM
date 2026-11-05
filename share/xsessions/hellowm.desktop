@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=HelloWM
+Comment=A minimal floating X11 desktop with a Windows-inspired taskbar
+Exec=hellowm
+TryExec=hellowm
+Type=Application
+DesktopNames=HelloWM
+X-LightDM-DesktopName=HelloWM

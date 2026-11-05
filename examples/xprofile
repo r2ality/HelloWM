@@ -1,0 +1,4 @@
+# LightDM normally sources ~/.xprofile before starting the selected X session.
+# Uncomment and edit ONE of these if you want a wallpaper under HelloWM.
+# xwallpaper --zoom "$HOME/Pictures/wallpaper.jpg" &
+# feh --bg-fill "$HOME/Pictures/wallpaper.jpg" &

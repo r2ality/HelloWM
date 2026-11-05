@@ -1,0 +1,12 @@
+[package]
+name = "hellowm"
+version = "0.1.0"
+edition = "2021"
+description = "A small floating X11 window manager with a minimal taskbar"
+license = "MIT"
+
+[dependencies]
+x11rb = "0.14"
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "gif", "webp", "tiff", "ico"] }

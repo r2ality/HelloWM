@@ -1,0 +1,7 @@
+#!/bin/sh
+
+# Set your own wallpaper here. HelloWM intentionally does not manage it.
+# xwallpaper --zoom "$HOME/Pictures/wallpaper.jpg"
+# feh --bg-fill "$HOME/Pictures/wallpaper.jpg"
+
+exec hellowm

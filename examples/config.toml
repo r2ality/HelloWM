@@ -1,0 +1,33 @@
+terminal = "alacritty"
+search_command = "rofi -show drun"
+fallback_search_command = "dmenu_run"
+panel_height = 56
+search_width = 300
+start_icon = "windows"
+start_image = "~/.config/assets/windows.png" # default PNG; custom image paths supported, scaled down to fit 30x30
+about_script = "~/.local/libexec/hellowm/about-computer.sh"
+launcher_creator = "~/.local/libexec/hellowm/create-launcher.sh"
+desktop_enabled = true
+theme = "dark"
+autostart = []
+
+[[keybinds]]
+chord = "Super+Return"
+action = "terminal"
+
+[[keybinds]]
+chord = "Super+q"
+action = "close"
+
+[[keybinds]]
+chord = "Super+d"
+action = "focus-search"
+
+[[keybinds]]
+chord = "Super+Shift+F1"
+action = "about"
+
+[[widgets]]
+name = "VPN"
+command = "nmcli -t -f TYPE connection show --active | grep -q '^vpn:' && printf 'VPN' || true"
+interval_seconds = 4
