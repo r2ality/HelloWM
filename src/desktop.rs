@@ -8,11 +8,15 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::time::Instant;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum IconKind {
+    Computer,
+    Browser,
+    Media,
+    Picture,
     Folder,
     Launcher,
     File,
@@ -39,7 +43,8 @@ pub struct Desktop {
     pub directory: PathBuf,
     layout_file: PathBuf,
     pub icons: Vec<DesktopIcon>,
-    pub selected: Option<usize>,
+    /// Paths of all currently selected icons (supports rubber-band selection).
+    pub selected: HashSet<PathBuf>,
     pub last_click: Option<(usize, Instant)>,
     pub dragging: Option<usize>,
 }
@@ -57,7 +62,7 @@ impl Desktop {
             directory,
             layout_file: config_directory.join("desktop-layout.toml"),
             icons: Vec::new(),
-            selected: None,
+            selected: HashSet::new(),
             last_click: None,
             dragging: None,
         };
@@ -74,7 +79,6 @@ impl Desktop {
             .and_then(|contents| toml::from_str::<SavedLayout>(&contents).ok())
             .map(|layout| layout.positions)
             .unwrap_or_default();
-        let selected_path = self.selected.and_then(|index| self.icons.get(index)).map(|icon| icon.path.clone());
         let dragged_path = self.dragging.and_then(|index| self.icons.get(index)).map(|icon| icon.path.clone());
         let mut paths = fs::read_dir(&self.directory)?
             .filter_map(Result::ok)
@@ -82,29 +86,39 @@ impl Desktop {
             .collect::<Vec<_>>();
         paths.sort_by_key(|path| path.file_name().unwrap_or_default().to_os_string());
 
-        self.icons.clear();
+        let mut icons = Vec::with_capacity(paths.len() + 1);
+        // A virtual Computer item is always present and opens HelloWM's native
+        // About Computer window. Its URI-like path is only an in-memory ID.
+        let computer_path = PathBuf::from("hellowm://computer");
+        let previous_computer = previous_positions.get(&computer_path).map(|&(x, y)| [x, y]);
+        let saved_computer = saved_positions.get(&computer_path.to_string_lossy().to_string()).copied();
+        let [computer_x, computer_y] = saved_computer.or(previous_computer).unwrap_or([18, 18]);
+        icons.push(DesktopIcon {
+            path: computer_path,
+            name: "Computer".into(),
+            x: computer_x,
+            y: computer_y,
+            kind: IconKind::Computer,
+        });
+
         for (index, path) in paths.into_iter().enumerate() {
             let name = display_name(&path);
-            let kind = if path.is_dir() {
-                IconKind::Folder
-            } else if path.extension().is_some_and(|extension| extension.to_string_lossy().eq_ignore_ascii_case("desktop")) {
-                IconKind::Launcher
-            } else {
-                IconKind::File
-            };
+            let kind = classify_icon(&path);
             let column = index / 8;
             let row = index % 8;
             let default_position = [
-                18_i16.saturating_add((column as i16).saturating_mul(92)),
-                18_i16.saturating_add((row as i16).saturating_mul(88)),
+                18_i16.saturating_add((column as i16).saturating_mul(104)),
+                112_i16.saturating_add((row as i16).saturating_mul(88)),
             ];
             let saved = saved_positions.get(&path.to_string_lossy().to_string()).copied();
             let previous = previous_positions.get(&path).map(|&(x, y)| [x, y]);
             let [x, y] = saved.or(previous).unwrap_or(default_position);
-            self.icons.push(DesktopIcon { path, name, x, y, kind });
+            icons.push(DesktopIcon { path, name, x, y, kind });
         }
-        self.selected = selected_path.and_then(|path| self.icons.iter().position(|icon| icon.path == path));
-        self.dragging = dragged_path.and_then(|path| self.icons.iter().position(|icon| icon.path == path));
+        let valid_paths = icons.iter().map(|icon| icon.path.clone()).collect::<HashSet<_>>();
+        self.selected.retain(|path| valid_paths.contains(path));
+        self.dragging = dragged_path.and_then(|path| icons.iter().position(|icon| icon.path == path));
+        self.icons = icons;
         Ok(())
     }
 
@@ -136,7 +150,11 @@ impl Desktop {
 
     pub fn open_icon(&self, index: usize) {
         let Some(icon) = self.icons.get(index) else { return; };
-        if icon.kind == IconKind::Launcher {
+        if icon.kind == IconKind::Computer {
+            // Opened by the Rust/X11 front-end in main.rs.
+            return;
+        }
+        if matches!(icon.kind, IconKind::Launcher | IconKind::Browser) {
             if let Some(exec) = desktop_exec(&icon.path) {
                 spawn_command(&exec);
                 return;
@@ -208,6 +226,33 @@ impl Desktop {
 struct SavedLayout {
     #[serde(default)]
     positions: BTreeMap<String, [i16; 2]>,
+}
+
+fn classify_icon(path: &Path) -> IconKind {
+    if path.is_dir() {
+        return IconKind::Folder;
+    }
+    let extension = path.extension().unwrap_or_default().to_string_lossy().to_ascii_lowercase();
+    if extension == "desktop" {
+        let contents = fs::read_to_string(path).unwrap_or_default().to_ascii_lowercase();
+        if ["firefox", "chromium", "chrome", "brave", "vivaldi", "opera", "librewolf", "browser"]
+            .iter().any(|needle| contents.contains(needle))
+        {
+            return IconKind::Browser;
+        }
+        return IconKind::Launcher;
+    }
+    if ["mp4", "mkv", "webm", "mov", "avi", "wmv", "flv", "m4v", "mpeg", "mpg", "ogv", "3gp", "ts", "mts", "m2ts"]
+        .contains(&extension.as_str())
+    {
+        return IconKind::Media;
+    }
+    if ["png", "jpg", "jpeg", "gif", "bmp", "webp", "tif", "tiff", "svg", "ico", "avif", "heic", "heif"]
+        .contains(&extension.as_str())
+    {
+        return IconKind::Picture;
+    }
+    IconKind::File
 }
 
 fn display_name(path: &Path) -> String {
