@@ -26,8 +26,9 @@ pub enum IconKind {
 pub struct IconBounds;
 
 impl IconBounds {
-    pub const WIDTH: i32 = 92;
-    pub const HEIGHT: i32 = 82;
+    // A square hit target makes selection, drag and right-click consistent.
+    pub const WIDTH: i32 = 88;
+    pub const HEIGHT: i32 = 88;
 }
 
 #[derive(Debug, Clone)]
@@ -47,6 +48,7 @@ pub struct Desktop {
     pub selected: HashSet<PathBuf>,
     pub last_click: Option<(usize, Instant)>,
     pub dragging: Option<usize>,
+    computer_hidden: bool,
 }
 
 impl Desktop {
@@ -65,6 +67,7 @@ impl Desktop {
             selected: HashSet::new(),
             last_click: None,
             dragging: None,
+            computer_hidden: false,
         };
         desktop.reload()?;
         Ok(desktop)
@@ -74,11 +77,12 @@ impl Desktop {
         let previous_positions = self.icons.iter()
             .map(|icon| (icon.path.clone(), (icon.x, icon.y)))
             .collect::<std::collections::HashMap<_, _>>();
-        let saved_positions = fs::read_to_string(&self.layout_file)
+        let saved_layout = fs::read_to_string(&self.layout_file)
             .ok()
             .and_then(|contents| toml::from_str::<SavedLayout>(&contents).ok())
-            .map(|layout| layout.positions)
             .unwrap_or_default();
+        self.computer_hidden = saved_layout.computer_hidden;
+        let saved_positions = saved_layout.positions;
         let dragged_path = self.dragging.and_then(|index| self.icons.get(index)).map(|icon| icon.path.clone());
         let mut paths = fs::read_dir(&self.directory)?
             .filter_map(Result::ok)
@@ -93,13 +97,15 @@ impl Desktop {
         let previous_computer = previous_positions.get(&computer_path).map(|&(x, y)| [x, y]);
         let saved_computer = saved_positions.get(&computer_path.to_string_lossy().to_string()).copied();
         let [computer_x, computer_y] = saved_computer.or(previous_computer).unwrap_or([18, 18]);
-        icons.push(DesktopIcon {
-            path: computer_path,
-            name: "Computer".into(),
-            x: computer_x,
-            y: computer_y,
-            kind: IconKind::Computer,
-        });
+        if !self.computer_hidden {
+            icons.push(DesktopIcon {
+                path: computer_path,
+                name: "Computer".into(),
+                x: computer_x,
+                y: computer_y,
+                kind: IconKind::Computer,
+            });
+        }
 
         for (index, path) in paths.into_iter().enumerate() {
             let name = display_name(&path);
@@ -143,7 +149,10 @@ impl Desktop {
         for icon in &self.icons {
             positions.insert(icon.path.to_string_lossy().to_string(), [icon.x, icon.y]);
         }
-        let serialized = toml::to_string_pretty(&SavedLayout { positions })
+        let serialized = toml::to_string_pretty(&SavedLayout {
+            positions,
+            computer_hidden: self.computer_hidden,
+        })
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         fs::write(&self.layout_file, serialized)
     }
@@ -161,6 +170,29 @@ impl Desktop {
             }
         }
         let _ = Command::new("xdg-open").arg(&icon.path).spawn();
+    }
+
+    /// Remove a desktop item safely. Files and launchers are moved to the
+    /// freedesktop Trash; the virtual Computer icon is hidden in the layout.
+    pub fn remove_icon(&mut self, path: &Path) -> io::Result<()> {
+        if path == Path::new("hellowm://computer") {
+            self.computer_hidden = true;
+            self.selected.remove(path);
+            self.icons.retain(|icon| icon.path.as_path() != path);
+            return self.save_layout();
+        }
+        if path.parent() != Some(self.directory.as_path()) {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "item is not directly inside the desktop directory"));
+        }
+        move_to_trash(path)?;
+        self.selected.remove(path);
+        self.reload()?;
+        self.save_layout()
+    }
+
+    pub fn open_containing_folder(&self, path: &Path) {
+        let folder = path.parent().unwrap_or(&self.directory);
+        let _ = Command::new("xdg-open").arg(folder).spawn();
     }
 
     pub fn create_launcher(&self, name: &str, command: &str) -> io::Result<PathBuf> {
@@ -226,6 +258,8 @@ impl Desktop {
 struct SavedLayout {
     #[serde(default)]
     positions: BTreeMap<String, [i16; 2]>,
+    #[serde(default)]
+    computer_hidden: bool,
 }
 
 fn classify_icon(path: &Path) -> IconKind {
@@ -341,6 +375,88 @@ fn file_uri_to_path(uri: &str) -> Option<PathBuf> {
         index += 1;
     }
     Some(PathBuf::from(std::ffi::OsString::from(String::from_utf8_lossy(&decoded).to_string())))
+}
+
+fn move_to_trash(path: &Path) -> io::Result<()> {
+    // Prefer GLib's implementation when available; it handles mounts and
+    // desktop-specific trash locations correctly.
+    if let Ok(status) = Command::new("gio").arg("trash").arg(path).status() {
+        if status.success() {
+            return Ok(());
+        }
+    }
+
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let data_home = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".local").join("share"));
+    let trash = data_home.join("Trash");
+    let files = trash.join("files");
+    let info = trash.join("info");
+    fs::create_dir_all(&files)?;
+    fs::create_dir_all(&info)?;
+
+    let original_name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+    let mut candidate = original_name.clone();
+    let mut suffix = 2_u32;
+    while files.join(&candidate).exists() || info.join(format!("{candidate}.trashinfo")).exists() {
+        candidate = format!("{original_name}.{suffix}");
+        suffix = suffix.saturating_add(1);
+    }
+    let destination = files.join(&candidate);
+    match fs::rename(path, &destination) {
+        Ok(()) => {},
+        Err(error) if error.raw_os_error() == Some(18) => {
+            copy_path(path, &destination)?;
+            remove_path(path)?;
+        }
+        Err(error) => return Err(error),
+    }
+
+    let escaped_path = percent_encode_path(&path.to_string_lossy());
+    let deletion_date = Command::new("date")
+        .arg("-u")
+        .arg("+%Y-%m-%dT%H:%M:%S")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "1970-01-01T00:00:00".into());
+    let info_path = info.join(format!("{candidate}.trashinfo"));
+    let info_contents = format!(
+        "[Trash Info]\nPath={escaped_path}\nDeletionDate={deletion_date}\n"
+    );
+    if let Err(error) = fs::write(&info_path, info_contents) {
+        let _ = fs::rename(&destination, path);
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn percent_encode_path(path: &str) -> String {
+    let mut encoded = String::with_capacity(path.len());
+    for byte in path.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'-' | b'_' | b'.' | b'~') {
+            encoded.push(byte as char);
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
+}
+
+fn remove_path(path: &Path) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || metadata.is_file() {
+        fs::remove_file(path)
+    } else if metadata.is_dir() {
+        fs::remove_dir_all(path)
+    } else {
+        fs::remove_file(path)
+    }
 }
 
 fn copy_path(source: &Path, destination: &Path) -> io::Result<()> {
