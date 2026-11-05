@@ -21,6 +21,13 @@ pub struct Config {
     pub panel_height: u16,
     /// Width of the rectangular taskbar search field in pixels.
     pub search_width: u16,
+    /// X11 core font name. HelloWM falls back to "fixed" when unavailable.
+    pub font_name: String,
+    /// Shell command that prints two clock lines (time, then day/date).
+    /// Set to an empty string to hide the clock.
+    pub clock_command: String,
+    /// Screenshot command; defaults to shotgun.
+    pub screenshot_command: String,
     /// "windows", "hello", or any short ASCII label (fallback when no image loads).
     pub start_icon: String,
     /// Image path used for the Start button. Supports a leading ~/ .
@@ -69,6 +76,9 @@ impl Default for Config {
             fallback_search_command: "dmenu_run".into(),
             panel_height: 56,
             search_width: 300,
+            font_name: "9x15".into(),
+            clock_command: "date '+%H:%M'; date '+%a, %d %b'".into(),
+            screenshot_command: "shotgun".into(),
             start_icon: "windows".into(),
             start_image: "~/.config/assets/windows.png".into(),
             about_script: "~/.local/libexec/hellowm/about-computer.sh".into(),
@@ -91,6 +101,22 @@ impl Default for Config {
                 KeybindConfig {
                     chord: "Super+Shift+F1".into(),
                     action: "about".into(),
+                },
+                KeybindConfig {
+                    chord: "Super+r".into(),
+                    action: "reload".into(),
+                },
+                KeybindConfig {
+                    chord: "Super+s".into(),
+                    action: "screenshot".into(),
+                },
+                KeybindConfig {
+                    chord: "Super+Up".into(),
+                    action: "maximize".into(),
+                },
+                KeybindConfig {
+                    chord: "Super+Down".into(),
+                    action: "minimize".into(),
                 },
             ],
             widgets: vec![WidgetConfig {
