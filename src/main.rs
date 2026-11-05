@@ -3,11 +3,13 @@ mod desktop;
 
 use config::{Config, KeybindConfig, WidgetConfig};
 use desktop::{Desktop, IconKind};
+use std::collections::HashMap;
 use std::error::Error;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
+use image::{imageops::FilterType, RgbaImage};
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{
     Atom, AtomEnum, BackPixmap, ButtonIndex, ChangeGCAux, ChangeWindowAttributesAux, ClientMessageEvent, ImageFormat,
@@ -26,6 +28,10 @@ const PANEL_PADDING: i32 = 10;
 const TRAY_ICON_SIZE: i32 = 22;
 const NETWORK_ICON_WIDTH: i32 = 26;
 const CLIENT_BORDER: u32 = 2;
+const TASK_ICON_SIZE: u16 = 28;
+const CLOCK_WIDTH: i32 = 112;
+const TITLEBAR_HEIGHT: u16 = 30;
+const DECORATION_BUTTON_WIDTH: i32 = 40;
 
 #[derive(Clone, Copy)]
 struct Palette {
@@ -79,6 +85,15 @@ enum DragKind {
     Resize,
 }
 
+#[derive(Clone, Copy)]
+struct WindowGeometry {
+    x: i16,
+    y: i16,
+    width: u16,
+    height: u16,
+    border_width: u16,
+}
+
 struct DragState {
     window: Window,
     kind: DragKind,
@@ -109,6 +124,20 @@ struct Atoms {
     xembed: Atom,
     manager: Atom,
     net_close_window: Atom,
+    net_wm_allowed_actions: Atom,
+    net_wm_action_move: Atom,
+    net_wm_action_resize: Atom,
+    net_wm_action_minimize: Atom,
+    net_wm_action_maximize_horz: Atom,
+    net_wm_action_maximize_vert: Atom,
+    net_wm_action_close: Atom,
+    net_wm_icon: Atom,
+    net_wm_state: Atom,
+    net_wm_state_hidden: Atom,
+    net_wm_state_maximized_vert: Atom,
+    net_wm_state_maximized_horz: Atom,
+    wm_state: Atom,
+    wm_change_state: Atom,
     xdnd_aware: Atom,
     xdnd_enter: Atom,
     xdnd_position: Atom,
@@ -144,6 +173,20 @@ impl Atoms {
             xembed: intern_atom(conn, "_XEMBED")?,
             manager: intern_atom(conn, "MANAGER")?,
             net_close_window: intern_atom(conn, "_NET_CLOSE_WINDOW")?,
+            net_wm_allowed_actions: intern_atom(conn, "_NET_WM_ALLOWED_ACTIONS")?,
+            net_wm_action_move: intern_atom(conn, "_NET_WM_ACTION_MOVE")?,
+            net_wm_action_resize: intern_atom(conn, "_NET_WM_ACTION_RESIZE")?,
+            net_wm_action_minimize: intern_atom(conn, "_NET_WM_ACTION_MINIMIZE")?,
+            net_wm_action_maximize_horz: intern_atom(conn, "_NET_WM_ACTION_MAXIMIZE_HORZ")?,
+            net_wm_action_maximize_vert: intern_atom(conn, "_NET_WM_ACTION_MAXIMIZE_VERT")?,
+            net_wm_action_close: intern_atom(conn, "_NET_WM_ACTION_CLOSE")?,
+            net_wm_icon: intern_atom(conn, "_NET_WM_ICON")?,
+            net_wm_state: intern_atom(conn, "_NET_WM_STATE")?,
+            net_wm_state_hidden: intern_atom(conn, "_NET_WM_STATE_HIDDEN")?,
+            net_wm_state_maximized_vert: intern_atom(conn, "_NET_WM_STATE_MAXIMIZED_VERT")?,
+            net_wm_state_maximized_horz: intern_atom(conn, "_NET_WM_STATE_MAXIMIZED_HORZ")?,
+            wm_state: intern_atom(conn, "WM_STATE")?,
+            wm_change_state: intern_atom(conn, "WM_CHANGE_STATE")?,
             xdnd_aware: intern_atom(conn, "XdndAware")?,
             xdnd_enter: intern_atom(conn, "XdndEnter")?,
             xdnd_position: intern_atom(conn, "XdndPosition")?,
@@ -167,9 +210,12 @@ struct Manager {
     desktop_window: Option<Window>,
     desktop_root_pixmap: Option<Pixmap>,
     desktop_icon_windows: Vec<(PathBuf, Window)>,
+    desktop_icon_sources: HashMap<IconKind, RgbaImage>,
     desktop: Option<Desktop>,
+    decorations: HashMap<Window, Window>,
     tray_owner: Window,
     gc: Gcontext,
+    text_font: u32,
     atoms: Atoms,
     config: Config,
     palette: Palette,
@@ -187,14 +233,21 @@ struct Manager {
     xdnd_source: Option<Window>,
     xdnd_accept_uri: bool,
     desktop_drag_start: Option<(usize, i16, i16, i16, i16)>,
+    desktop_selection_start: Option<(i16, i16)>,
+    desktop_selection_rect: Option<(i16, i16, i16, i16)>,
     last_desktop_scan: Instant,
     clients: Vec<Window>,
+    minimized: Vec<Window>,
+    maximized_restore: HashMap<Window, WindowGeometry>,
+    client_icons: HashMap<Window, Pixmap>,
     active: Option<Window>,
     task_hits: Vec<(i16, i16, Window)>,
     tray_windows: Vec<Window>,
     tray_enabled: bool,
     network: NetworkState,
     last_network_poll: Instant,
+    clock_lines: (String, String),
+    last_clock_poll: Instant,
     widgets: Vec<WidgetRuntime>,
     keybinds: Vec<BoundKey>,
     drag: Option<DragState>,
@@ -206,11 +259,7 @@ impl Manager {
         let mut config = config::load();
         config.panel_height = config.panel_height.clamp(50, 80);
         config.search_width = config.search_width.clamp(180, 420);
-        for (chord, action) in [("Super+d", "focus-search"), ("Super+Shift+F1", "about")] {
-            if !config.keybinds.iter().any(|binding| binding.chord.eq_ignore_ascii_case(chord)) {
-                config.keybinds.push(KeybindConfig { chord: chord.into(), action: action.into() });
-            }
-        }
+        ensure_builtin_keybinds(&mut config);
 
         let (conn, screen_num) = x11rb::connect(None)?;
         let screen = &conn.setup().roots[screen_num];
@@ -249,6 +298,7 @@ impl Manager {
 
         let initial_palette = allocate_palette(&conn, screen.default_colormap, &config.theme)?;
         let start_image = load_start_image(&conn, screen, &config.start_image, &config.theme);
+        let desktop_icon_sources = load_desktop_icon_sources();
 
         let mut desktop_state = None;
         let mut desktop_window = None;
@@ -275,6 +325,7 @@ impl Manager {
                                 EventMask::EXPOSURE
                                     | EventMask::BUTTON_PRESS
                                     | EventMask::BUTTON_RELEASE
+                                    | EventMask::POINTER_MOTION
                                     | EventMask::STRUCTURE_NOTIFY,
                             ),
                     )?.check()?;
@@ -355,9 +406,8 @@ impl Manager {
         )?
         .check()?;
 
-        let font = conn.generate_id()?;
-        conn.open_font(font, b"fixed")?.check()?;
-        conn.change_gc(gc, &ChangeGCAux::new().font(font))?.check()?;
+        let text_font = open_text_font(&conn, &config.font_name)?;
+        conn.change_gc(gc, &ChangeGCAux::new().font(text_font))?.check()?;
 
         let desktop_root_pixmap = read_root_pixmap(
             &conn,
@@ -365,6 +415,7 @@ impl Manager {
             atoms.xrootpmap_id,
             atoms.esetroot_pmap_id,
         );
+        let initial_clock_lines = read_clock_lines(&config.clock_command);
 
         let mut manager = Self {
             conn,
@@ -373,9 +424,12 @@ impl Manager {
             desktop_window,
             desktop_root_pixmap,
             desktop_icon_windows: Vec::new(),
+            desktop_icon_sources,
             desktop: desktop_state,
+            decorations: HashMap::new(),
             tray_owner,
             gc,
+            text_font,
             atoms,
             config,
             palette: initial_palette,
@@ -393,14 +447,21 @@ impl Manager {
             xdnd_source: None,
             xdnd_accept_uri: false,
             desktop_drag_start: None,
+            desktop_selection_start: None,
+            desktop_selection_rect: None,
             last_desktop_scan: Instant::now(),
             clients: Vec::new(),
+            minimized: Vec::new(),
+            maximized_restore: HashMap::new(),
+            client_icons: HashMap::new(),
             active: None,
             task_hits: Vec::new(),
             tray_windows: Vec::new(),
             tray_enabled: false,
             network: NetworkState::default(),
             last_network_poll: Instant::now() - Duration::from_secs(10),
+            clock_lines: initial_clock_lines,
+            last_clock_poll: Instant::now(),
             widgets: Vec::new(),
             keybinds: Vec::new(),
             drag: None,
@@ -519,6 +580,17 @@ impl Manager {
             self.atoms.net_wm_strut,
             self.atoms.net_wm_strut_partial,
             self.atoms.net_close_window,
+            self.atoms.net_wm_allowed_actions,
+            self.atoms.net_wm_action_move,
+            self.atoms.net_wm_action_resize,
+            self.atoms.net_wm_action_minimize,
+            self.atoms.net_wm_action_maximize_horz,
+            self.atoms.net_wm_action_maximize_vert,
+            self.atoms.net_wm_action_close,
+            self.atoms.net_wm_state,
+            self.atoms.net_wm_state_hidden,
+            self.atoms.net_wm_state_maximized_vert,
+            self.atoms.net_wm_state_maximized_horz,
         ];
         self.conn.change_property32(
             PropMode::REPLACE,
@@ -611,6 +683,7 @@ impl Manager {
     }
 
     fn load_keybinds(&mut self) -> Result<(), Box<dyn Error>> {
+        self.keybinds.clear();
         for item in &self.config.keybinds {
             match self.parse_keybind(item) {
                 Ok(binding) => {
@@ -704,6 +777,14 @@ impl Manager {
     }
 
     fn tick(&mut self) {
+        if self.last_clock_poll.elapsed() >= Duration::from_secs(1) {
+            self.last_clock_poll = Instant::now();
+            let lines = read_clock_lines(&self.config.clock_command);
+            if lines != self.clock_lines {
+                self.clock_lines = lines;
+                let _ = self.draw_clock();
+            }
+        }
         if self.last_network_poll.elapsed() >= Duration::from_secs(3) {
             self.refresh_external_state(false);
             let _ = self.draw_panel();
@@ -749,7 +830,13 @@ impl Manager {
 
     fn handle_event(&mut self, event: Event) -> Result<(), Box<dyn Error>> {
         match event {
-            Event::MapRequest(ev) => self.manage_window(ev.window)?,
+            Event::MapRequest(ev) => {
+                if self.clients.contains(&ev.window) {
+                    self.restore_window(ev.window)?;
+                } else {
+                    self.manage_window(ev.window)?;
+                }
+            }
             Event::ConfigureRequest(ev) => self.handle_configure_request(ev)?,
             Event::DestroyNotify(ev) => {
                 self.remove_client(ev.window);
@@ -757,16 +844,17 @@ impl Manager {
                 self.draw_panel()?;
             }
             Event::UnmapNotify(ev) => {
-                if self.clients.contains(&ev.window) {
+                if self.clients.contains(&ev.window) && !self.minimized.contains(&ev.window) {
                     self.remove_client(ev.window);
+                    self.draw_panel()?;
+                } else if self.minimized.contains(&ev.window) {
                     self.draw_panel()?;
                 }
             }
             Event::ButtonPress(ev) => self.handle_button_press(ev)?,
             Event::ButtonRelease(_ev) => {
-                self.drag = None;
-                // Icon drags use an X11 pointer grab, so release is delivered
-                // even when the pointer has moved outside the icon window.
+                let had_drag = self.drag.take().is_some();
+                if had_drag { let _ = self.conn.ungrab_pointer(CURRENT_TIME); }
                 if self.desktop_drag_start.take().is_some() {
                     let _ = self.conn.ungrab_pointer(CURRENT_TIME);
                     if let Some(desktop) = &mut self.desktop {
@@ -776,9 +864,17 @@ impl Manager {
                         }
                     }
                 }
+                if self.desktop_selection_start.take().is_some() {
+                    let _ = self.conn.ungrab_pointer(CURRENT_TIME);
+                    self.finish_desktop_selection()?;
+                } else if self.drag.is_none() {
+                    let _ = self.conn.ungrab_pointer(CURRENT_TIME);
+                }
             }
             Event::MotionNotify(ev) => {
-                if self.desktop_icon_windows.iter().any(|(_, window)| *window == ev.event) {
+                if self.desktop_selection_start.is_some() {
+                    self.handle_desktop_selection_motion(ev.root_x, ev.root_y)?;
+                } else if self.desktop_icon_windows.iter().any(|(_, window)| *window == ev.event) {
                     self.handle_desktop_motion(ev.root_x, ev.root_y)?;
                 } else {
                     self.handle_motion(ev)?;
@@ -804,10 +900,11 @@ impl Manager {
                         self.draw_desktop_icon_window(index)?;
                     } else if self.about_window.as_ref().is_some_and(|about| about.window == ev.window) {
                         self.draw_about()?;
+                    } else if let Some(client) = self.decoration_client(ev.window) {
+                        self.draw_client_decoration(client)?;
+                    } else if self.desktop_window == Some(ev.window) {
+                        self.draw_desktop_selection_overlay()?;
                     }
-                    // The desktop parent paints its configured wallpaper
-                    // background in the X server; no client-side redraw is
-                    // needed for its Expose events.
                 }
             }
             Event::SelectionNotify(ev) => self.handle_selection_notify(ev)?,
@@ -826,6 +923,10 @@ impl Manager {
                 } else if self.clients.contains(&ev.window)
                     && (ev.atom == self.atoms.net_wm_name || ev.atom == self.atoms.wm_name)
                 {
+                    self.draw_panel()?;
+                    self.draw_client_decoration(ev.window)?;
+                } else if self.clients.contains(&ev.window) && ev.atom == self.atoms.net_wm_icon {
+                    self.refresh_client_icon(ev.window)?;
                     self.draw_panel()?;
                 }
             }
@@ -869,10 +970,10 @@ impl Manager {
         let height = geometry.height.max(180);
         if x == 0 && y == 0 {
             x = ((self.screen_width as i32 - width as i32) / 2).max(12);
-            y = ((self.screen_height as i32 - self.panel_height as i32 - height as i32) / 2).max(12);
+            y = ((self.screen_height as i32 - self.panel_height as i32 - height as i32 - TITLEBAR_HEIGHT as i32) / 2).max(12);
         }
         x = x.clamp(0, self.screen_width.saturating_sub(120) as i32);
-        y = y.clamp(0, self.screen_height.saturating_sub(self.panel_height + 80) as i32);
+        y = (y + TITLEBAR_HEIGHT as i32).clamp(TITLEBAR_HEIGHT as i32, self.screen_height.saturating_sub(self.panel_height + 80) as i32);
 
         let border = if self.active == Some(window) { self.palette.accent } else { self.palette.border };
         self.conn.change_window_attributes(
@@ -909,18 +1010,40 @@ impl Manager {
         }
 
         self.clients.push(window);
+        self.set_client_allowed_actions(window)?;
+        self.set_icccm_state(window, 1)?; // NormalState
         self.conn.map_window(window)?;
+        self.create_client_decoration(window)?;
+        self.refresh_client_icon(window)?;
         self.update_client_list()?;
         self.focus_window(window)?;
+        // Respect an application's initial EWMH maximize request if present.
+        let initial_states = self.read_net_wm_states(window);
+        if initial_states.contains(&self.atoms.net_wm_state_maximized_vert)
+            || initial_states.contains(&self.atoms.net_wm_state_maximized_horz)
+        {
+            self.set_maximized(window, true)?;
+        }
         self.draw_panel()?;
         Ok(())
     }
 
     fn remove_client(&mut self, window: Window) {
+        if let Some(decoration) = self.decorations.remove(&window) {
+            let _ = self.conn.destroy_window(decoration);
+        }
         self.clients.retain(|candidate| *candidate != window);
+        self.minimized.retain(|candidate| *candidate != window);
+        self.maximized_restore.remove(&window);
+        if let Some(pixmap) = self.client_icons.remove(&window) {
+            let _ = self.conn.free_pixmap(pixmap);
+        }
         if self.active == Some(window) {
-            self.active = self.clients.last().copied();
-            if let Some(next) = self.active {
+            self.active = None;
+            let next = self.clients.iter().rev()
+                .copied()
+                .find(|candidate| !self.minimized.contains(candidate));
+            if let Some(next) = next {
                 let _ = self.focus_window(next);
             } else {
                 let _ = self.conn.set_input_focus(InputFocus::POINTER_ROOT, self.root, CURRENT_TIME);
@@ -942,10 +1065,12 @@ impl Manager {
     }
 
     fn focus_window(&mut self, window: Window) -> Result<(), Box<dyn Error>> {
-        if !self.clients.contains(&window) {
+        if !self.clients.contains(&window) || self.minimized.contains(&window) {
             return Ok(());
         }
-        if let Some(previous) = self.active {
+        self.set_icccm_state(window, 1)?;
+        let previous_active = self.active;
+        if let Some(previous) = previous_active {
             if previous != window {
                 let _ = self.conn.change_window_attributes(
                     previous,
@@ -962,6 +1087,9 @@ impl Manager {
             &x11rb::protocol::xproto::ConfigureWindowAux::new().stack_mode(StackMode::ABOVE),
         )?;
         self.conn.set_input_focus(InputFocus::POINTER_ROOT, window, CURRENT_TIME)?;
+        if let Some(decoration) = self.decorations.get(&window).copied() {
+            self.conn.configure_window(decoration, &x11rb::protocol::xproto::ConfigureWindowAux::new().stack_mode(StackMode::ABOVE))?;
+        }
         self.conn.change_property32(
             PropMode::REPLACE,
             self.root,
@@ -970,29 +1098,225 @@ impl Manager {
             &[window],
         )?;
         self.active = Some(window);
+        if let Some(previous) = previous_active.filter(|previous| *previous != window) {
+            self.draw_client_decoration(previous)?;
+        }
+        self.draw_client_decoration(window)?;
         self.draw_panel()?;
         Ok(())
     }
 
+    fn read_net_wm_states(&self, window: Window) -> Vec<Atom> {
+        self.conn
+            .get_property(false, window, self.atoms.net_wm_state, AtomEnum::ATOM, 0, 128)
+            .ok()
+            .and_then(|cookie| cookie.reply().ok())
+            .and_then(|property| property.value32().map(|values| values.collect::<Vec<_>>()))
+            .unwrap_or_default()
+    }
+
+    fn write_net_wm_states(&self, window: Window, states: &[Atom]) -> Result<(), Box<dyn Error>> {
+        if states.is_empty() {
+            self.conn.delete_property(window, self.atoms.net_wm_state)?.check()?;
+        } else {
+            self.conn.change_property32(
+                PropMode::REPLACE,
+                window,
+                self.atoms.net_wm_state,
+                AtomEnum::ATOM,
+                states,
+            )?.check()?;
+        }
+        Ok(())
+    }
+
+    fn set_net_wm_state_atom(&self, window: Window, atom: Atom, enabled: bool) -> Result<(), Box<dyn Error>> {
+        let mut states = self.read_net_wm_states(window);
+        if enabled {
+            if !states.contains(&atom) { states.push(atom); }
+        } else {
+            states.retain(|candidate| *candidate != atom);
+        }
+        self.write_net_wm_states(window, &states)
+    }
+
+    fn set_client_allowed_actions(&self, window: Window) -> Result<(), Box<dyn Error>> {
+        let actions = [
+            self.atoms.net_wm_action_move,
+            self.atoms.net_wm_action_resize,
+            self.atoms.net_wm_action_minimize,
+            self.atoms.net_wm_action_maximize_horz,
+            self.atoms.net_wm_action_maximize_vert,
+            self.atoms.net_wm_action_close,
+        ];
+        self.conn.change_property32(
+            PropMode::REPLACE,
+            window,
+            self.atoms.net_wm_allowed_actions,
+            AtomEnum::ATOM,
+            &actions,
+        )?.check()?;
+        Ok(())
+    }
+
+    fn set_icccm_state(&self, window: Window, state: u32) -> Result<(), Box<dyn Error>> {
+        // ICCCM WM_STATE: WithdrawnState=0, NormalState=1, IconicState=3.
+        self.conn.change_property32(
+            PropMode::REPLACE,
+            window,
+            self.atoms.wm_state,
+            self.atoms.wm_state,
+            &[state, NONE],
+        )?.check()?;
+        Ok(())
+    }
+
+    fn minimize_window(&mut self, window: Window) -> Result<(), Box<dyn Error>> {
+        if !self.clients.contains(&window) || self.minimized.contains(&window) {
+            return Ok(());
+        }
+        self.minimized.push(window);
+        self.set_net_wm_state_atom(window, self.atoms.net_wm_state_hidden, true)?;
+        self.set_icccm_state(window, 3)?;
+        self.conn.unmap_window(window)?.check()?;
+        if let Some(decoration) = self.decorations.get(&window).copied() {
+            self.conn.unmap_window(decoration)?.check()?;
+        }
+
+        if self.active == Some(window) {
+            self.active = None;
+            let next = self.clients.iter().rev()
+                .copied()
+                .find(|candidate| *candidate != window && !self.minimized.contains(candidate));
+            if let Some(next) = next {
+                self.focus_window(next)?;
+            } else {
+                self.conn.set_input_focus(InputFocus::POINTER_ROOT, self.root, CURRENT_TIME)?;
+                self.conn.delete_property(self.root, self.atoms.net_active_window)?;
+            }
+        }
+        self.draw_panel()?;
+        Ok(())
+    }
+
+    fn restore_window(&mut self, window: Window) -> Result<(), Box<dyn Error>> {
+        if !self.clients.contains(&window) {
+            return self.manage_window(window);
+        }
+        if self.minimized.contains(&window) {
+            self.minimized.retain(|candidate| *candidate != window);
+            self.set_net_wm_state_atom(window, self.atoms.net_wm_state_hidden, false)?;
+            self.set_icccm_state(window, 1)?;
+            self.conn.map_window(window)?.check()?;
+            if let Some(decoration) = self.decorations.get(&window).copied() {
+                self.update_client_decoration(window)?;
+                self.conn.map_window(decoration)?.check()?;
+            }
+        }
+        self.focus_window(window)?;
+        self.draw_panel()?;
+        Ok(())
+    }
+
+    fn set_maximized(&mut self, window: Window, enabled: bool) -> Result<(), Box<dyn Error>> {
+        if !self.clients.contains(&window) { return Ok(()); }
+        if enabled {
+            if !self.maximized_restore.contains_key(&window) {
+                let geometry = self.conn.get_geometry(window)?.reply()?;
+                self.maximized_restore.insert(window, WindowGeometry {
+                    x: geometry.x,
+                    y: geometry.y,
+                    width: geometry.width,
+                    height: geometry.height,
+                    border_width: geometry.border_width,
+                });
+            }
+            let available_width = self.screen_width.saturating_sub(CLIENT_BORDER as u16 * 2).max(1);
+            let available_height = self.screen_height
+                .saturating_sub(self.panel_height)
+                .saturating_sub(TITLEBAR_HEIGHT)
+                .saturating_sub(CLIENT_BORDER as u16 * 2)
+                .max(1);
+            self.conn.configure_window(
+                window,
+                &x11rb::protocol::xproto::ConfigureWindowAux::new()
+                    .x(0)
+                    .y(TITLEBAR_HEIGHT as i32)
+                    .width(available_width as u32)
+                    .height(available_height as u32)
+                    .border_width(CLIENT_BORDER),
+            )?.check()?;
+            self.set_net_wm_state_atom(window, self.atoms.net_wm_state_maximized_vert, true)?;
+            self.set_net_wm_state_atom(window, self.atoms.net_wm_state_maximized_horz, true)?;
+            self.update_client_decoration(window)?;
+        } else if let Some(geometry) = self.maximized_restore.remove(&window) {
+            self.conn.configure_window(
+                window,
+                &x11rb::protocol::xproto::ConfigureWindowAux::new()
+                    .x(geometry.x as i32)
+                    .y(geometry.y as i32)
+                    .width(geometry.width as u32)
+                    .height(geometry.height as u32)
+                    .border_width(geometry.border_width as u32),
+            )?.check()?;
+            self.update_client_decoration(window)?;
+            self.set_net_wm_state_atom(window, self.atoms.net_wm_state_maximized_vert, false)?;
+            self.set_net_wm_state_atom(window, self.atoms.net_wm_state_maximized_horz, false)?;
+        } else {
+            self.set_net_wm_state_atom(window, self.atoms.net_wm_state_maximized_vert, false)?;
+            self.set_net_wm_state_atom(window, self.atoms.net_wm_state_maximized_horz, false)?;
+        }
+        self.draw_panel()?;
+        Ok(())
+    }
+
+    fn handle_net_wm_state_request(&mut self, window: Window, data: [u32; 5]) -> Result<(), Box<dyn Error>> {
+        let action = data[0]; // 0=remove, 1=add, 2=toggle
+        let requested = [data[1], data[2]];
+        if requested.contains(&self.atoms.net_wm_state_hidden) {
+            let hidden = self.minimized.contains(&window);
+            match action {
+                0 => self.restore_window(window)?,
+                1 => self.minimize_window(window)?,
+                2 if hidden => self.restore_window(window)?,
+                2 => self.minimize_window(window)?,
+                _ => {}
+            }
+        }
+        if requested.contains(&self.atoms.net_wm_state_maximized_vert)
+            || requested.contains(&self.atoms.net_wm_state_maximized_horz)
+        {
+            let maximized = self.maximized_restore.contains_key(&window);
+            match action {
+                0 => self.set_maximized(window, false)?,
+                1 => self.set_maximized(window, true)?,
+                2 => self.set_maximized(window, !maximized)?,
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
     fn handle_configure_request(
-        &self,
+        &mut self,
         ev: x11rb::protocol::xproto::ConfigureRequestEvent,
     ) -> Result<(), Box<dyn Error>> {
         let mask = ev.value_mask;
         let mut aux = x11rb::protocol::xproto::ConfigureWindowAux::new();
-        if mask.contains(ConfigWindow::X) {
+        let is_maximized = self.maximized_restore.contains_key(&ev.window);
+        if !is_maximized && mask.contains(ConfigWindow::X) {
             aux = aux.x(ev.x as i32);
         }
-        if mask.contains(ConfigWindow::Y) {
-            aux = aux.y(ev.y as i32);
+        if !is_maximized && mask.contains(ConfigWindow::Y) {
+            aux = aux.y((ev.y as i32).max(TITLEBAR_HEIGHT as i32));
         }
-        if mask.contains(ConfigWindow::WIDTH) {
+        if !is_maximized && mask.contains(ConfigWindow::WIDTH) {
             aux = aux.width(ev.width as u32);
         }
-        if mask.contains(ConfigWindow::HEIGHT) {
+        if !is_maximized && mask.contains(ConfigWindow::HEIGHT) {
             aux = aux.height(ev.height as u32);
         }
-        if mask.contains(ConfigWindow::BORDER_WIDTH) {
+        if !is_maximized && mask.contains(ConfigWindow::BORDER_WIDTH) {
             aux = aux.border_width(ev.border_width as u32);
         }
         if mask.contains(ConfigWindow::SIBLING) && mask.contains(ConfigWindow::STACK_MODE) {
@@ -1001,7 +1325,13 @@ impl Manager {
         if mask.contains(ConfigWindow::STACK_MODE) {
             aux = aux.stack_mode(ev.stack_mode);
         }
-        self.conn.configure_window(ev.window, &aux)?;
+        // A maximized client's geometry is controlled by the WM. Do not send
+        // an empty ConfigureWindow request when its only request was for size
+        // or position; only stacking changes remain relevant in that case.
+        if !is_maximized || mask.contains(ConfigWindow::STACK_MODE) {
+            self.conn.configure_window(ev.window, &aux)?;
+            self.update_client_decoration(ev.window)?;
+        }
         self.conn.configure_window(
             self.panel,
             &x11rb::protocol::xproto::ConfigureWindowAux::new().stack_mode(StackMode::ABOVE),
@@ -1013,6 +1343,10 @@ impl Manager {
         &mut self,
         ev: x11rb::protocol::xproto::ButtonPressEvent,
     ) -> Result<(), Box<dyn Error>> {
+        if let Some(client) = self.decoration_client(ev.event) {
+            self.handle_decoration_button(ev, client)?;
+            return Ok(());
+        }
         if ev.event == self.panel {
             if ev.detail == 3 {
                 self.toggle_theme()?;
@@ -1022,12 +1356,24 @@ impl Manager {
                 let x = ev.event_x as i32;
                 if x < self.search_end_x() {
                     self.launch_search();
-                } else if let Some((_, _, window)) = self
-                    .task_hits
-                    .iter()
-                    .find(|(start, end, _)| x >= *start as i32 && x < *end as i32)
-                {
-                    self.focus_window(*window)?;
+                } else {
+                    // Copy the hit target out before calling methods that
+                    // mutably borrow the manager. Keeping the iterator's
+                    // reference alive here would conflict with those calls.
+                    let task_window = self
+                        .task_hits
+                        .iter()
+                        .find(|(start, end, _)| x >= *start as i32 && x < *end as i32)
+                        .map(|(_, _, window)| *window);
+                    if let Some(window) = task_window {
+                        if self.minimized.contains(&window) {
+                            self.restore_window(window)?;
+                        } else if self.active == Some(window) {
+                            self.minimize_window(window)?;
+                        } else {
+                            self.focus_window(window)?;
+                        }
+                    }
                 }
             }
             return Ok(());
@@ -1084,7 +1430,14 @@ impl Manager {
                     .and_then(|desktop| desktop.last_click.as_ref())
                     .is_some_and(|(previous, when)| *previous == index && when.elapsed() <= Duration::from_millis(450));
                 if double_click {
-                    if let Some(desktop) = &self.desktop { desktop.open_icon(index); }
+                    let is_computer = self.desktop.as_ref()
+                        .and_then(|desktop| desktop.icons.get(index))
+                        .is_some_and(|icon| icon.kind == IconKind::Computer);
+                    if is_computer {
+                        self.open_about()?;
+                    } else if let Some(desktop) = &self.desktop {
+                        desktop.open_icon(index);
+                    }
                     if let Some(desktop) = &mut self.desktop { desktop.last_click = None; }
                     self.desktop_drag_start = None;
                     return Ok(());
@@ -1096,7 +1449,9 @@ impl Manager {
                     return Ok(());
                 };
                 if let Some(desktop) = &mut self.desktop {
-                    desktop.selected = Some(index);
+                    let selected_path = desktop.icons.get(index).map(|icon| icon.path.clone());
+                    desktop.selected.clear();
+                    if let Some(path) = selected_path { desktop.selected.insert(path); }
                     desktop.last_click = Some((index, Instant::now()));
                 }
                 let grab = self.conn.grab_pointer(
@@ -1125,7 +1480,9 @@ impl Manager {
             }
             3 => {
                 if let Some(desktop) = &mut self.desktop {
-                    desktop.selected = Some(index);
+                    let selected_path = desktop.icons.get(index).map(|icon| icon.path.clone());
+                    desktop.selected.clear();
+                    if let Some(path) = selected_path { desktop.selected.insert(path); }
                     desktop.last_click = None;
                 }
                 self.draw_desktop()?;
@@ -1138,13 +1495,26 @@ impl Manager {
     fn handle_desktop_button(&mut self, ev: x11rb::protocol::xproto::ButtonPressEvent) -> Result<(), Box<dyn Error>> {
         match ev.detail {
             1 => {
+                self.desktop_drag_start = None;
+                self.desktop_selection_start = Some((ev.root_x, ev.root_y));
+                self.desktop_selection_rect = None;
                 if let Some(desktop) = &mut self.desktop {
-                    desktop.selected = None;
                     desktop.last_click = None;
                     desktop.dragging = None;
                 }
-                self.desktop_drag_start = None;
-                self.draw_desktop()?;
+                let grab = self.conn.grab_pointer(
+                    false,
+                    ev.event,
+                    EventMask::BUTTON_RELEASE | EventMask::POINTER_MOTION,
+                    GrabMode::ASYNC,
+                    GrabMode::ASYNC,
+                    NONE,
+                    NONE,
+                    CURRENT_TIME,
+                )?.reply()?;
+                if grab.status != GrabStatus::SUCCESS {
+                    self.desktop_selection_start = None;
+                }
             }
             2 => self.open_about()?,
             3 => {
@@ -1158,6 +1528,211 @@ impl Manager {
                 }
             }
             _ => {}
+        }
+        Ok(())
+    }
+
+    fn create_client_decoration(&mut self, client: Window) -> Result<(), Box<dyn Error>> {
+        let geometry = self.conn.get_geometry(client)?.reply()?;
+        let decoration = self.conn.generate_id()?;
+        self.conn.create_window(
+            self.screen_depth,
+            decoration,
+            self.root,
+            geometry.x,
+            geometry.y.saturating_sub(TITLEBAR_HEIGHT as i16),
+            geometry.width.max(160),
+            TITLEBAR_HEIGHT,
+            0,
+            WindowClass::INPUT_OUTPUT,
+            self.screen_visual,
+            &CreateWindowAux::new()
+                .background_pixel(self.palette.panel)
+                .border_pixel(self.palette.border)
+                .override_redirect(1u32)
+                .event_mask(EventMask::EXPOSURE | EventMask::BUTTON_PRESS | EventMask::BUTTON_RELEASE | EventMask::POINTER_MOTION),
+        )?.check()?;
+        self.decorations.insert(client, decoration);
+        self.conn.map_window(decoration)?.check()?;
+        self.conn.configure_window(decoration, &x11rb::protocol::xproto::ConfigureWindowAux::new().stack_mode(StackMode::ABOVE))?;
+        self.draw_client_decoration(client)?;
+        Ok(())
+    }
+
+    fn decoration_client(&self, decoration: Window) -> Option<Window> {
+        self.decorations.iter().find_map(|(client, candidate)| (*candidate == decoration).then_some(*client))
+    }
+
+    fn update_client_decoration(&self, client: Window) -> Result<(), Box<dyn Error>> {
+        let Some(decoration) = self.decorations.get(&client).copied() else { return Ok(()); };
+        let geometry = match self.conn.get_geometry(client)?.reply() {
+            Ok(geometry) => geometry,
+            Err(_) => return Ok(()),
+        };
+        self.conn.configure_window(
+            decoration,
+            &x11rb::protocol::xproto::ConfigureWindowAux::new()
+                .x(geometry.x as i32)
+                .y(geometry.y.saturating_sub(TITLEBAR_HEIGHT as i16) as i32)
+                .width(geometry.width.max(160) as u32)
+                .height(TITLEBAR_HEIGHT as u32),
+        )?;
+        self.draw_client_decoration(client)
+    }
+
+    fn draw_client_decoration(&self, client: Window) -> Result<(), Box<dyn Error>> {
+        let Some(decoration) = self.decorations.get(&client).copied() else { return Ok(()); };
+        let width = self.conn.get_geometry(decoration)?.reply()?.width as i32;
+        let height = TITLEBAR_HEIGHT as i32;
+        let focused = self.active == Some(client);
+        let background = if focused { self.palette.surface } else { self.palette.panel };
+        self.fill_rect_on(decoration, 0, 0, width, height, background)?;
+        self.set_gc(if focused { self.palette.accent } else { self.palette.border }, background)?;
+        self.conn.poly_rectangle(decoration, self.gc, &[Rectangle { x: 0, y: 0, width: width.max(1) as u16, height: height as u16 }])?;
+        let title = self.window_title(client).unwrap_or_else(|| "Application".into());
+        let title_room = (width - (DECORATION_BUTTON_WIDTH * 3) - 28).max(0) / 9;
+        self.draw_text_on(decoration, &truncate_ascii(&title, title_room as usize), 10, 20, self.palette.text, background)?;
+
+        let min_x = width - DECORATION_BUTTON_WIDTH * 3;
+        let max_x = width - DECORATION_BUTTON_WIDTH * 2;
+        let close_x = width - DECORATION_BUTTON_WIDTH;
+        self.fill_rect_on(decoration, min_x, 1, DECORATION_BUTTON_WIDTH, height - 2, background)?;
+        self.fill_rect_on(decoration, max_x, 1, DECORATION_BUTTON_WIDTH, height - 2, background)?;
+        self.fill_rect_on(decoration, close_x, 1, DECORATION_BUTTON_WIDTH - 1, height - 2, if focused { self.palette.border } else { background })?;
+        let mid_y = height / 2;
+        self.set_gc(self.palette.text, background)?;
+        self.conn.poly_line(x11rb::protocol::xproto::CoordMode::ORIGIN, decoration, self.gc, &[
+            Point { x: (min_x + 13) as i16, y: (mid_y + 5) as i16 },
+            Point { x: (min_x + 27) as i16, y: (mid_y + 5) as i16 },
+        ])?;
+        self.conn.poly_rectangle(decoration, self.gc, &[Rectangle {
+            x: (max_x + 13) as i16, y: (mid_y - 7) as i16, width: 14, height: 13,
+        }])?;
+        self.conn.poly_line(x11rb::protocol::xproto::CoordMode::ORIGIN, decoration, self.gc, &[
+            Point { x: (close_x + 13) as i16, y: (mid_y - 7) as i16 },
+            Point { x: (close_x + 27) as i16, y: (mid_y + 7) as i16 },
+        ])?;
+        self.conn.poly_line(x11rb::protocol::xproto::CoordMode::ORIGIN, decoration, self.gc, &[
+            Point { x: (close_x + 27) as i16, y: (mid_y - 7) as i16 },
+            Point { x: (close_x + 13) as i16, y: (mid_y + 7) as i16 },
+        ])?;
+        Ok(())
+    }
+
+    fn handle_decoration_button(
+        &mut self,
+        ev: x11rb::protocol::xproto::ButtonPressEvent,
+        client: Window,
+    ) -> Result<(), Box<dyn Error>> {
+        if ev.detail != 1 { return Ok(()); }
+        self.focus_window(client)?;
+        let geometry = self.conn.get_geometry(ev.event)?.reply()?;
+        let width = geometry.width as i32;
+        let x = ev.event_x as i32;
+        if x >= width - DECORATION_BUTTON_WIDTH {
+            self.close_window(client)?;
+        } else if x >= width - DECORATION_BUTTON_WIDTH * 2 {
+            let enable = !self.maximized_restore.contains_key(&client);
+            self.set_maximized(client, enable)?;
+        } else if x >= width - DECORATION_BUTTON_WIDTH * 3 {
+            self.minimize_window(client)?;
+        } else {
+            let client_geometry = self.conn.get_geometry(client)?.reply()?;
+            let grab = self.conn.grab_pointer(
+                false, ev.event, EventMask::BUTTON_RELEASE | EventMask::POINTER_MOTION,
+                GrabMode::ASYNC, GrabMode::ASYNC, NONE, NONE, CURRENT_TIME,
+            )?.reply()?;
+            if grab.status == GrabStatus::SUCCESS {
+                self.drag = Some(DragState {
+                    window: client,
+                    kind: DragKind::Move,
+                    start_root_x: ev.root_x,
+                    start_root_y: ev.root_y,
+                    start_x: client_geometry.x,
+                    start_y: client_geometry.y,
+                    start_width: client_geometry.width,
+                    start_height: client_geometry.height,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_desktop_selection_motion(&mut self, root_x: i16, root_y: i16) -> Result<(), Box<dyn Error>> {
+        let Some((start_x, start_y)) = self.desktop_selection_start else { return Ok(()); };
+        let left = start_x.min(root_x);
+        let top = start_y.min(root_y);
+        let right = start_x.max(root_x);
+        let bottom = start_y.max(root_y);
+        let rect = (left, top, right, bottom);
+        if self.desktop_selection_rect != Some(rect) {
+            self.clear_desktop_selection_outline()?;
+            self.desktop_selection_rect = Some(rect);
+            self.draw_desktop_selection_overlay()?;
+
+            let mut selected = std::collections::HashSet::new();
+            if right - left > 3 || bottom - top > 3 {
+                if let Some(desktop) = &self.desktop {
+                    for icon in &desktop.icons {
+                        let icon_right = icon.x.saturating_add(desktop::IconBounds::WIDTH as i16);
+                        let icon_bottom = icon.y.saturating_add(desktop::IconBounds::HEIGHT as i16);
+                        let intersects = icon.x < right && icon_right > left && icon.y < bottom && icon_bottom > top;
+                        if intersects { selected.insert(icon.path.clone()); }
+                    }
+                }
+            }
+            let changed = if let Some(desktop) = &mut self.desktop {
+                let changed = desktop.selected != selected;
+                if changed { desktop.selected = selected; }
+                changed
+            } else { false };
+            if changed {
+                let count = self.desktop.as_ref().map_or(0, |desktop| desktop.icons.len());
+                for index in 0..count { self.draw_desktop_icon_window(index)?; }
+            }
+        }
+        Ok(())
+    }
+
+    fn finish_desktop_selection(&mut self) -> Result<(), Box<dyn Error>> {
+        let clear_selection = self.desktop_selection_rect
+            .map_or(true, |(left, top, right, bottom)| right - left <= 3 && bottom - top <= 3);
+        if clear_selection {
+            if let Some(desktop) = &mut self.desktop { desktop.selected.clear(); }
+            let count = self.desktop.as_ref().map_or(0, |desktop| desktop.icons.len());
+            for index in 0..count { self.draw_desktop_icon_window(index)?; }
+        }
+        self.clear_desktop_selection_outline()?;
+        self.desktop_selection_rect = None;
+        Ok(())
+    }
+
+    fn clear_desktop_selection_outline(&self) -> Result<(), Box<dyn Error>> {
+        let Some(window) = self.desktop_window else { return Ok(()); };
+        if let Some((left, top, right, bottom)) = self.desktop_selection_rect {
+            let x = left.min(right);
+            let y = top.min(bottom);
+            let width = (right - left).unsigned_abs().max(1);
+            let height = (bottom - top).unsigned_abs().max(1);
+            self.conn.clear_area(false, window, x, y, width, height)?;
+        }
+        Ok(())
+    }
+
+    fn draw_desktop_selection_overlay(&self) -> Result<(), Box<dyn Error>> {
+        let Some(window) = self.desktop_window else { return Ok(()); };
+        if let Some((left, top, right, bottom)) = self.desktop_selection_rect {
+            let x = left.min(right);
+            let y = top.min(bottom);
+            let width = (right - left).unsigned_abs().max(1);
+            let height = (bottom - top).unsigned_abs().max(1);
+            self.set_gc(self.palette.accent, self.palette.panel)?;
+            self.conn.poly_rectangle(window, self.gc, &[Rectangle {
+                x,
+                y,
+                width,
+                height,
+            }])?;
         }
         Ok(())
     }
@@ -1337,7 +1912,7 @@ impl Manager {
             desktop::IconBounds::WIDTH as u16,
             desktop::IconBounds::HEIGHT as u16,
         )?.check()?;
-        self.draw_desktop_icon(window, icon, desktop.selected == Some(index))
+        self.draw_desktop_icon(window, icon, desktop.selected.contains(&icon.path))
     }
 
     fn draw_desktop_icon(
@@ -1360,35 +1935,113 @@ impl Manager {
                 self.palette.accent,
             )?;
         }
-        match icon.kind {
-            IconKind::Folder => {
-                self.fill_rect_on(drawable, x + 11, y + 13, 36, 25, 0x00a0e6)?;
-                self.fill_rect_on(drawable, x + 13, y + 8, 17, 8, 0x00a0e6)?;
-                self.fill_rect_on(drawable, x + 12, y + 15, 34, 20, 0x00b8ff)?;
+        if let Some(source) = self.desktop_icon_sources.get(&icon.kind) {
+            let image_x = 22_i32;
+            let image_y = 2_i32;
+            let blended = self.composite_desktop_icon(
+                source,
+                icon.x.saturating_add(image_x as i16),
+                icon.y.saturating_add(image_y as i16),
+                selected,
+            );
+            if let Some(data) = rgba_to_x11_data(&self.conn, self.screen_depth, self.screen_visual, &blended, (32, 36, 44)) {
+                let (image_width, image_height) = blended.dimensions();
+                self.conn.put_image(
+                    ImageFormat::Z_PIXMAP,
+                    drawable,
+                    self.gc,
+                    image_width as u16,
+                    image_height as u16,
+                    image_x as i16,
+                    image_y as i16,
+                    0,
+                    self.screen_depth,
+                    &data,
+                )?;
             }
-            IconKind::Launcher => {
-                self.fill_rect_on(drawable, x + 10, y + 7, 40, 40, self.palette.accent)?;
-                self.draw_text_on(drawable, ">", x + 24, y + 34, 0x00ffffff, self.palette.accent)?;
-            }
-            IconKind::File => {
-                self.fill_rect_on(drawable, x + 15, y + 6, 31, 41, 0x00eeeeee)?;
-                self.set_gc(self.palette.border, self.palette.panel)?;
-                self.conn.poly_rectangle(drawable, self.gc, &[Rectangle {
-                    x: (x + 15) as i16,
-                    y: (y + 6) as i16,
-                    width: 31,
-                    height: 41,
-                }])?;
-                self.fill_rect_on(drawable, x + 21, y + 19, 19, 2, 0x00808080)?;
-                self.fill_rect_on(drawable, x + 21, y + 25, 19, 2, 0x00808080)?;
-                self.fill_rect_on(drawable, x + 21, y + 31, 14, 2, 0x00808080)?;
-            }
+        } else {
+            self.fill_rect_on(drawable, x + 15, y + 6, 31, 41, 0x00eeeeee)?;
+            self.set_gc(self.palette.border, self.palette.panel)?;
+            self.conn.poly_rectangle(drawable, self.gc, &[Rectangle {
+                x: (x + 15) as i16, y: (y + 6) as i16, width: 31, height: 41,
+            }])?;
         }
         let label = truncate_ascii(&icon.name, 11);
-        let text_x = ((desktop::IconBounds::WIDTH - label.len() as i32 * 8) / 2).max(1);
+        let text_x = ((desktop::IconBounds::WIDTH - label.len() as i32 * 9) / 2).max(1);
         self.draw_transparent_text_on(drawable, &label, text_x + 1, y + 65, 0x00000000)?;
         self.draw_transparent_text_on(drawable, &label, text_x, y + 64, 0x00ffffff)?;
         Ok(())
+    }
+
+    fn composite_desktop_icon(&self, source: &RgbaImage, root_x: i16, root_y: i16, selected: bool) -> RgbaImage {
+        let (width, height) = source.dimensions();
+        let mut output = source.clone();
+        let drawable = self.desktop_root_pixmap
+            .map(|pixmap| pixmap as u32)
+            .or_else(|| self.desktop_window.map(|window| window as u32));
+        let reply = if selected {
+            None
+        } else if let Some(drawable) = drawable {
+            match self.conn.get_image(
+                ImageFormat::Z_PIXMAP, drawable, root_x, root_y, width as u16, height as u16, u32::MAX,
+            ) {
+                Ok(cookie) => cookie.reply().ok(),
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+        let setup = self.conn.setup();
+        let Some(format) = setup.pixmap_formats.iter().find(|format| format.depth == self.screen_depth) else { return output; };
+        let bytes_per_pixel = ((format.bits_per_pixel as usize) + 7) / 8;
+        if bytes_per_pixel == 0 { return output; }
+        let pad = format.scanline_pad as usize;
+        if pad == 0 { return output; }
+        let stride = (((width as usize * bytes_per_pixel * 8 + pad - 1) / pad) * pad) / 8;
+        let Some(visual) = setup.roots.iter().flat_map(|screen| screen.allowed_depths.iter())
+            .flat_map(|depth| depth.visuals.iter()).find(|visual| visual.visual_id == self.screen_visual) else { return output; };
+        for py in 0..height as usize {
+            for px in 0..width as usize {
+                let background = if selected {
+                    (
+                        unmasked_component(self.palette.accent, visual.red_mask),
+                        unmasked_component(self.palette.accent, visual.green_mask),
+                        unmasked_component(self.palette.accent, visual.blue_mask),
+                    )
+                } else if let Some(reply) = &reply {
+                    let offset = py * stride + px * bytes_per_pixel;
+                    if offset + bytes_per_pixel > reply.data.len() { continue; }
+                    let mut pixel = 0_u32;
+                    for byte in 0..bytes_per_pixel {
+                        let shift = if setup.image_byte_order == x11rb::protocol::xproto::ImageOrder::LSB_FIRST {
+                            byte * 8
+                        } else {
+                            (bytes_per_pixel - byte - 1) * 8
+                        };
+                        pixel |= (reply.data[offset + byte] as u32) << shift;
+                    }
+                    (
+                        unmasked_component(pixel, visual.red_mask),
+                        unmasked_component(pixel, visual.green_mask),
+                        unmasked_component(pixel, visual.blue_mask),
+                    )
+                } else {
+                    (32, 36, 44)
+                };
+                let foreground = source.get_pixel(px as u32, py as u32).0;
+                let alpha = foreground[3] as u32;
+                let blend = |front: u8, back: u8| -> u8 {
+                    ((front as u32 * alpha + back as u32 * (255 - alpha) + 127) / 255) as u8
+                };
+                output.put_pixel(px as u32, py as u32, image::Rgba([
+                    blend(foreground[0], background.0),
+                    blend(foreground[1], background.1),
+                    blend(foreground[2], background.2),
+                    255,
+                ]));
+            }
+        }
+        output
     }
 
     fn handle_xdnd_message(&mut self, ev: ClientMessageEvent) -> Result<(), Box<dyn Error>> {
@@ -1472,11 +2125,19 @@ impl Manager {
                 let x = (drag.start_x as i32 + dx)
                     .clamp(0, self.screen_width.saturating_sub(120) as i32);
                 let y = (drag.start_y as i32 + dy)
-                    .clamp(0, self.screen_height.saturating_sub(self.panel_height + 48) as i32);
+                    .clamp(TITLEBAR_HEIGHT as i32, self.screen_height.saturating_sub(self.panel_height + 48) as i32);
                 self.conn.configure_window(
                     drag.window,
                     &x11rb::protocol::xproto::ConfigureWindowAux::new().x(x).y(y),
                 )?;
+                if let Some(decoration) = self.decorations.get(&drag.window).copied() {
+                    self.conn.configure_window(
+                        decoration,
+                        &x11rb::protocol::xproto::ConfigureWindowAux::new()
+                            .x(x)
+                            .y(y - TITLEBAR_HEIGHT as i32),
+                    )?;
+                }
             }
             DragKind::Resize => {
                 let width = (drag.start_width as i32 + dx).clamp(200, self.screen_width as i32) as u32;
@@ -1488,6 +2149,12 @@ impl Manager {
                         .width(width)
                         .height(height),
                 )?;
+                if let Some(decoration) = self.decorations.get(&drag.window).copied() {
+                    self.conn.configure_window(
+                        decoration,
+                        &x11rb::protocol::xproto::ConfigureWindowAux::new().width(width),
+                    )?;
+                }
             }
         }
         Ok(())
@@ -1551,10 +2218,120 @@ impl Manager {
             "search" => self.launch_search(),
             "focus-search" => self.focus_search()?,
             "about" => self.open_about()?,
+            "reload" => self.reload_configuration()?,
+            "screenshot" => self.take_screenshot(),
+            "maximize" => {
+                if let Some(window) = self.active {
+                    let enabled = !self.maximized_restore.contains_key(&window);
+                    self.set_maximized(window, enabled)?;
+                }
+            }
+            "minimize" => {
+                if let Some(window) = self.active { self.minimize_window(window)?; }
+            }
             "quit" => self.running = false,
             command if command.starts_with("exec:") => spawn_shell(command.trim_start_matches("exec:")),
             other => eprintln!("HelloWM: unknown keybind action '{other}'"),
         }
+        Ok(())
+    }
+
+    fn take_screenshot(&self) {
+        let configured = self.config.screenshot_command.trim();
+        if configured.is_empty() {
+            eprintln!("HelloWM: screenshot_command is empty");
+            return;
+        }
+        let program = configured.split_whitespace().next().unwrap_or("");
+        if command_exists(program) {
+            spawn_shell(configured);
+        } else if command_exists("shotgun") {
+            spawn_shell("shotgun");
+        } else if command_exists("flameshot") {
+            spawn_shell("flameshot gui");
+        } else if command_exists("scrot") {
+            spawn_shell("scrot");
+        } else if command_exists("maim") {
+            spawn_shell("maim ~/Pictures/screenshot-$(date +%Y%m%d-%H%M%S).png");
+        } else {
+            eprintln!("HelloWM: no screenshot tool found; install shotgun, flameshot, scrot, or maim");
+        }
+    }
+
+    fn reload_configuration(&mut self) -> Result<(), Box<dyn Error>> {
+        let mut next = config::load();
+        ensure_builtin_keybinds(&mut next);
+        next.panel_height = next.panel_height.clamp(50, 80);
+        next.search_width = next.search_width.clamp(180, 420);
+        if next.font_name.trim().is_empty() { next.font_name = "9x15".into(); }
+
+        let new_height = next.panel_height.min(self.screen_height.saturating_sub(1));
+        let new_width = next.search_width as i32;
+        let new_palette = allocate_palette_for_window(&self.conn, self.panel, &next.theme)?;
+        let new_start_image = load_start_image(
+            &self.conn,
+            &self.conn.setup().roots[self.screen_num],
+            &next.start_image,
+            &next.theme,
+        );
+        let new_font = open_text_font(&self.conn, &next.font_name)?;
+
+        // AnyKey + AnyModifier clears grabs from the previous keybind table.
+        self.conn.ungrab_key(0, self.root, ModMask::ANY)?.check()?;
+        self.keybinds.clear();
+        self.config = next;
+        self.panel_height = new_height;
+        self.search_width = new_width;
+        self.palette = new_palette;
+        self.start_image = new_start_image;
+        let old_font = std::mem::replace(&mut self.text_font, new_font);
+
+        self.conn.change_gc(self.gc, &ChangeGCAux::new()
+            .font(new_font)
+            .foreground(self.palette.text)
+            .background(self.palette.panel))?.check()?;
+        if old_font != new_font { let _ = self.conn.close_font(old_font); }
+        self.conn.change_window_attributes(
+            self.panel,
+            &ChangeWindowAttributesAux::new().background_pixel(self.palette.panel),
+        )?.check()?;
+        self.conn.configure_window(
+            self.panel,
+            &x11rb::protocol::xproto::ConfigureWindowAux::new()
+                .x(0)
+                .y(self.screen_height.saturating_sub(self.panel_height) as i32)
+                .width(self.screen_width as u32)
+                .height(self.panel_height as u32)
+                .stack_mode(StackMode::ABOVE),
+        )?.check()?;
+        self.set_panel_properties()?;
+        if let Some(desktop_window) = self.desktop_window {
+            self.conn.configure_window(
+                desktop_window,
+                &x11rb::protocol::xproto::ConfigureWindowAux::new()
+                    .x(0)
+                    .y(0)
+                    .width(self.screen_width as u32)
+                    .height(self.screen_height.saturating_sub(self.panel_height).max(1) as u32),
+            )?.check()?;
+        }
+
+        for window in self.clients.clone() {
+            let border = if Some(window) == self.active { self.palette.accent } else { self.palette.border };
+            let _ = self.conn.change_window_attributes(window, &ChangeWindowAttributesAux::new().border_pixel(border));
+            self.refresh_client_icon(window)?;
+        }
+        self.init_widgets();
+        self.load_keybinds()?;
+        self.refresh_external_state(true);
+        self.clock_lines = read_clock_lines(&self.config.clock_command);
+        self.last_clock_poll = Instant::now();
+        self.draw_panel()?;
+        self.apply_desktop_background()?;
+        self.draw_desktop()?;
+        if self.about_window.is_some() { self.draw_about()?; }
+        self.conn.flush()?;
+        eprintln!("HelloWM: configuration reloaded");
         Ok(())
     }
 
@@ -1683,7 +2460,7 @@ impl Manager {
         self.draw_text_on(window, "HelloWM", 18, 66, self.palette.accent, self.palette.surface)?;
         let mut y = 94;
         for line in &about.lines {
-            self.draw_text_on(window, &truncate_ascii(line, ((about.width as i32 - 40) / 8) as usize), 18, y, self.palette.text, self.palette.surface)?;
+            self.draw_text_on(window, &truncate_ascii(line, ((about.width as i32 - 40) / 9) as usize), 18, y, self.palette.text, self.palette.surface)?;
             y += 20;
         }
         self.draw_text_on(window, "Press Esc or click to close", 18, about.height as i32 - 18, self.palette.muted, self.palette.surface)?;
@@ -1734,18 +2511,20 @@ impl Manager {
                 .foreground(self.palette.text)
                 .background(self.palette.panel),
         )?;
-        for window in &self.clients {
-            let border = if Some(*window) == self.active { self.palette.accent } else { self.palette.border };
+        for window in self.clients.clone() {
+            let border = if Some(window) == self.active { self.palette.accent } else { self.palette.border };
             let _ = self.conn.change_window_attributes(
-                *window,
+                window,
                 &ChangeWindowAttributesAux::new().border_pixel(border),
             );
+            let _ = self.refresh_client_icon(window);
         }
         if let Err(error) = config::save(&self.config) {
             eprintln!("HelloWM: could not save theme setting: {error}");
         }
         self.draw_panel()?;
         self.draw_desktop()?;
+        for window in self.clients.clone() { self.draw_client_decoration(window)?; }
         if self.about_window.is_some() { self.draw_about()?; }
         Ok(())
     }
@@ -1757,11 +2536,23 @@ impl Manager {
         } else if ev.window == self.tray_owner && ev.type_ == self.atoms.tray_opcode && self.tray_enabled && data[1] == 0 {
             self.dock_tray_icon(data[2])?;
         } else if ev.type_ == self.atoms.net_active_window {
-            self.focus_window(ev.window)?;
+            if self.minimized.contains(&ev.window) {
+                self.restore_window(ev.window)?;
+            } else {
+                self.focus_window(ev.window)?;
+            }
         } else if ev.type_ == self.atoms.net_close_window {
             if self.clients.contains(&ev.window) {
                 self.close_window(ev.window)?;
             }
+        } else if ev.type_ == self.atoms.wm_change_state && self.clients.contains(&ev.window) {
+            if data[0] == 3 { // ICCCM IconicState
+                self.minimize_window(ev.window)?;
+            } else if data[0] == 1 {
+                self.restore_window(ev.window)?;
+            }
+        } else if ev.type_ == self.atoms.net_wm_state && self.clients.contains(&ev.window) {
+            self.handle_net_wm_state_request(ev.window, data)?;
         }
         Ok(())
     }
@@ -1858,8 +2649,11 @@ impl Manager {
         } else {
             "Type here to search".to_string()
         };
-        let search_text = truncate_ascii(&raw_search_text, ((search_end - START_BUTTON_WIDTH - 42).max(0) / 8) as usize);
-        let search_color = if self.search_active { self.palette.text } else { self.palette.search_text };
+        let search_text = truncate_ascii(&raw_search_text, ((search_end - START_BUTTON_WIDTH - 42).max(0) / 9) as usize);
+        // The search field intentionally uses the opposite foreground/background
+        // pairing from the taskbar: near-black text on white in dark mode, and
+        // white text on charcoal in light mode.
+        let search_color = self.palette.search_text;
         self.draw_text(
             &search_text,
             START_BUTTON_WIDTH + 34,
@@ -1882,13 +2676,14 @@ impl Manager {
             .filter(|widget| !widget.value.trim().is_empty())
             .map(|widget| widget.value.chars().filter(|c| c.is_ascii()).collect::<String>())
             .collect::<Vec<_>>();
-        let widgets_width: i32 = widget_texts.iter().map(|text| (text.len() as i32 * 8) + 22).sum();
+        let widgets_width: i32 = widget_texts.iter().map(|text| (text.len() as i32 * 9) + 22).sum();
         let network_width = (if self.network.wifi_present { NETWORK_ICON_WIDTH } else { 0 })
             + (if self.network.wired_present { NETWORK_ICON_WIDTH } else { 0 });
-        let right_region = tray_width + widgets_width + network_width + PANEL_PADDING * 2;
+        let clock_width = if self.config.clock_command.trim().is_empty() { 0 } else { CLOCK_WIDTH };
+        let right_region = tray_width + widgets_width + network_width + clock_width + PANEL_PADDING * 2;
         let tasks_end = (width - right_region).max(search_end);
         let available = (tasks_end - search_end).max(0);
-        let minimum_task_width = 64;
+        let minimum_task_width = 48;
         let visible_count = if available < minimum_task_width {
             0
         } else {
@@ -1897,7 +2692,7 @@ impl Manager {
         let task_width = if visible_count == 0 {
             0
         } else {
-            (available / visible_count as i32).clamp(minimum_task_width, 184)
+            (available / visible_count as i32).clamp(minimum_task_width, 88)
         };
 
         self.task_hits.clear();
@@ -1909,36 +2704,17 @@ impl Manager {
             let background = if focused { self.palette.surface } else { self.palette.panel };
             self.fill_rect(x, 0, button_width, height, background)?;
 
-            // The compact square glyph makes the task buttons read like classic
-            // Windows 10 app buttons without depending on application icon APIs.
-            let title = self.window_title(window).unwrap_or_else(|| "Application".into());
-            let glyph = title
-                .chars()
-                .find(|character| character.is_ascii_alphanumeric())
-                .unwrap_or('?')
-                .to_ascii_uppercase()
-                .to_string();
-            let glyph_x = x + 10;
-            let glyph_y = (height - 18) / 2;
-            self.fill_rect(glyph_x, glyph_y, 18, 18, self.palette.accent)?;
-            self.draw_text(&glyph, glyph_x + 6, glyph_y + 14, self.palette.text, self.palette.accent)?;
+            // Windows 10-style compact task buttons: prefer each client's
+            // _NET_WM_ICON image, and use a letter tile only as a fallback.
+            let icon_x = x + (button_width - TASK_ICON_SIZE as i32) / 2;
+            let icon_y = (height - TASK_ICON_SIZE as i32) / 2 - 1;
+            self.draw_client_icon(window, icon_x, icon_y)?;
 
-            if button_width >= 104 {
-                let text_limit = ((button_width - 42).max(1) / 8) as usize;
-                let short_title = truncate_ascii(&title, text_limit);
-                self.draw_text(
-                    &short_title,
-                    x + 36,
-                    height / 2 + 5,
-                    self.palette.text,
-                    background,
-                )?;
-            }
-
-            // Open windows get a small bottom indicator; the focused window uses
-            // the Windows-blue accent, inactive windows use a muted line.
-            let indicator_color = if focused { self.palette.accent } else { self.palette.muted };
-            let indicator_width = button_width.min(28).max(12);
+            // Minimized windows remain in the task list, but use a dimmer
+            // indicator. The active window retains the blue activity line.
+            let is_minimized = self.minimized.contains(&window);
+            let indicator_color = if focused { self.palette.accent } else if is_minimized { self.palette.border } else { self.palette.muted };
+            let indicator_width = button_width.min(24).max(10);
             self.fill_rect(
                 x + (button_width - indicator_width) / 2,
                 height - 3,
@@ -1950,9 +2726,9 @@ impl Manager {
             x = end;
         }
 
-        let mut right_x = width - PANEL_PADDING - tray_width - network_width - widgets_width;
+        let mut right_x = width - PANEL_PADDING - clock_width - tray_width - network_width - widgets_width;
         for text in &widget_texts {
-            let widget_width = text.len() as i32 * 8 + 22;
+            let widget_width = text.len() as i32 * 9 + 22;
             self.draw_text(text, right_x + 8, height / 2 + 5, self.palette.accent, self.palette.panel)?;
             right_x += widget_width;
         }
@@ -1964,7 +2740,7 @@ impl Manager {
             self.draw_wired_icon(right_x + 2, height / 2 - 8, self.network.wired_connected)?;
         }
 
-        let mut tray_x = width - PANEL_PADDING - tray_width;
+        let mut tray_x = width - PANEL_PADDING - clock_width - tray_width;
         for window in &self.tray_windows {
             self.conn.configure_window(
                 *window,
@@ -1977,11 +2753,32 @@ impl Manager {
             )?;
             tray_x += TRAY_ICON_SIZE;
         }
+        self.draw_clock()?;
         // The panel is a dock and should remain visible over floating clients.
         self.conn.configure_window(
             self.panel,
             &x11rb::protocol::xproto::ConfigureWindowAux::new().stack_mode(StackMode::ABOVE),
         )?;
+        Ok(())
+    }
+
+    fn draw_clock(&self) -> Result<(), Box<dyn Error>> {
+        if self.config.clock_command.trim().is_empty() {
+            return Ok(());
+        }
+        let width = CLOCK_WIDTH;
+        let x = self.screen_width as i32 - PANEL_PADDING - width;
+        let height = self.panel_height as i32;
+        self.fill_rect(x, 0, width, height, self.palette.panel)?;
+        let text_x = x + 6;
+        // X11 image_text coordinates are baselines. Keep the time and
+        // day/date on separate, evenly-spaced rows within the taskbar.
+        let first_y = (height / 2 - 10).max(14);
+        let second_y = (height / 2 + 10).min(height - 3);
+        self.draw_text(&self.clock_lines.0, text_x, first_y, self.palette.text, self.palette.panel)?;
+        if !self.clock_lines.1.is_empty() {
+            self.draw_text(&self.clock_lines.1, text_x, second_y, self.palette.muted, self.palette.panel)?;
+        }
         Ok(())
     }
 
@@ -2073,6 +2870,101 @@ impl Manager {
             Point { x: (x + 13) as i16, y: (y + 12) as i16 },
         ];
         self.conn.poly_line(CoordMode::ORIGIN, self.panel, self.gc, &points)?;
+        Ok(())
+    }
+
+    fn refresh_client_icon(&mut self, window: Window) -> Result<(), Box<dyn Error>> {
+        if let Some(previous) = self.client_icons.remove(&window) {
+            let _ = self.conn.free_pixmap(previous);
+        }
+
+        let property = match self.conn
+            .get_property(false, window, self.atoms.net_wm_icon, AtomEnum::CARDINAL, 0, 65_536)?
+            .reply()
+        {
+            Ok(property) => property,
+            Err(_) => return Ok(()),
+        };
+        let values = property.value32().map(|items| items.collect::<Vec<_>>()).unwrap_or_default();
+        let Some(source) = select_net_wm_icon(&values) else {
+            return Ok(());
+        };
+        let (width, height) = source.dimensions();
+        let largest = width.max(height).max(1);
+        let scaled_width = ((width as u64 * TASK_ICON_SIZE as u64) / largest as u64).max(1) as u32;
+        let scaled_height = ((height as u64 * TASK_ICON_SIZE as u64) / largest as u64).max(1) as u32;
+        let scaled = image::imageops::resize(&source, scaled_width, scaled_height, FilterType::Lanczos3);
+        let mut canvas = RgbaImage::new(TASK_ICON_SIZE as u32, TASK_ICON_SIZE as u32);
+        let offset_x = (TASK_ICON_SIZE as u32 - scaled_width) / 2;
+        let offset_y = (TASK_ICON_SIZE as u32 - scaled_height) / 2;
+        image::imageops::overlay(&mut canvas, &scaled, offset_x as i64, offset_y as i64);
+
+        let backdrop = if self.config.theme.eq_ignore_ascii_case("light") {
+            (227, 227, 227)
+        } else {
+            (31, 31, 31)
+        };
+        let Some(data) = rgba_to_x11_data(
+            &self.conn,
+            self.screen_depth,
+            self.screen_visual,
+            &canvas,
+            backdrop,
+        ) else {
+            return Ok(());
+        };
+
+        let pixmap = self.conn.generate_id()?;
+        self.conn.create_pixmap(
+            self.screen_depth,
+            pixmap,
+            self.panel,
+            TASK_ICON_SIZE,
+            TASK_ICON_SIZE,
+        )?.check()?;
+        if let Err(error) = self.conn.put_image(
+            ImageFormat::Z_PIXMAP,
+            pixmap,
+            self.gc,
+            TASK_ICON_SIZE,
+            TASK_ICON_SIZE,
+            0,
+            0,
+            0,
+            self.screen_depth,
+            &data,
+        )?.check() {
+            let _ = self.conn.free_pixmap(pixmap);
+            return Err(Box::new(error));
+        }
+        self.client_icons.insert(window, pixmap);
+        Ok(())
+    }
+
+    fn draw_client_icon(&self, window: Window, x: i32, y: i32) -> Result<(), Box<dyn Error>> {
+        if let Some(pixmap) = self.client_icons.get(&window) {
+            self.conn.copy_area(
+                *pixmap,
+                self.panel,
+                self.gc,
+                0,
+                0,
+                x as i16,
+                y as i16,
+                TASK_ICON_SIZE,
+                TASK_ICON_SIZE,
+            )?.check()?;
+            return Ok(());
+        }
+
+        let title = self.window_title(window).unwrap_or_else(|| "Application".into());
+        let glyph = title.chars()
+            .find(|character| character.is_ascii_alphanumeric())
+            .unwrap_or('?')
+            .to_ascii_uppercase()
+            .to_string();
+        self.fill_rect(x + 4, y + 4, 20, 20, self.palette.accent)?;
+        self.draw_text(&glyph, x + 10, y + 20, self.palette.text, self.palette.accent)?;
         Ok(())
     }
 
@@ -2176,6 +3068,65 @@ impl Manager {
     }
 }
 
+fn ensure_builtin_keybinds(config: &mut Config) {
+    for (chord, action) in [
+        ("Super+d", "focus-search"),
+        ("Super+Shift+F1", "about"),
+        ("Super+r", "reload"),
+        ("Super+s", "screenshot"),
+        ("Super+Up", "maximize"),
+        ("Super+Down", "minimize"),
+    ] {
+        if !config.keybinds.iter().any(|binding| binding.chord.eq_ignore_ascii_case(chord)) {
+            config.keybinds.push(KeybindConfig { chord: chord.into(), action: action.into() });
+        }
+    }
+}
+
+fn open_text_font(conn: &RustConnection, requested: &str) -> Result<u32, Box<dyn Error>> {
+    let candidates = [requested.trim(), "9x15", "fixed"];
+    for candidate in candidates {
+        if candidate.is_empty() { continue; }
+        let font = conn.generate_id()?;
+        if let Ok(cookie) = conn.open_font(font, candidate.as_bytes()) {
+            if cookie.check().is_ok() {
+                return Ok(font);
+            }
+        }
+    }
+    Err("HelloWM: could not open the configured X11 font or the fixed fallback".into())
+}
+
+fn read_clock_lines(command: &str) -> (String, String) {
+    if command.trim().is_empty() { return (String::new(), String::new()); }
+    let output = Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output();
+    let Ok(output) = output else { return ("--:--".into(), "".into()); };
+    if !output.status.success() { return ("--:--".into(), "".into()); }
+    // Accept real line breaks and old config commands that printed literal
+    // backslash-n sequences. The shipped default now runs two `date` commands
+    // so it does not depend on shell/date escape handling at all.
+    let raw = String::from_utf8_lossy(&output.stdout)
+        .replace("\\\\n", "\n")
+        .replace("\\n", "\n")
+        .replace("\\r", "\n")
+        .replace("\r", "\n")
+        .replace('\r', "\n");
+    let lines = raw
+        .split('\n')
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|line| truncate_ascii(line, 20))
+        .collect::<Vec<_>>();
+    let first = lines.first().cloned().unwrap_or_default();
+    let second = lines.get(1).cloned().unwrap_or_default();
+    (first, second)
+}
+
 fn command_exists(program: &str) -> bool {
     if program.is_empty() { return false; }
     let candidate = PathBuf::from(program);
@@ -2254,6 +3205,110 @@ fn load_start_image(
     Some(StartImage { width: width as u16, height: height as u16, data })
 }
 
+fn load_desktop_icon_sources() -> HashMap<IconKind, RgbaImage> {
+    let mut sources = HashMap::new();
+    for (kind, bytes) in [
+        (IconKind::Computer, &include_bytes!("../assets/desktop-icons/computer.png")[..]),
+        (IconKind::Browser, &include_bytes!("../assets/desktop-icons/browser.png")[..]),
+        (IconKind::Media, &include_bytes!("../assets/desktop-icons/media.png")[..]),
+        (IconKind::Picture, &include_bytes!("../assets/desktop-icons/picture.png")[..]),
+        (IconKind::Folder, &include_bytes!("../assets/desktop-icons/files.png")[..]),
+        (IconKind::Launcher, &include_bytes!("../assets/desktop-icons/files.png")[..]),
+        (IconKind::File, &include_bytes!("../assets/desktop-icons/files.png")[..]),
+    ] {
+        if let Ok(decoded) = image::load_from_memory(bytes) {
+            sources.insert(kind, decoded.thumbnail(48, 48).to_rgba8());
+        }
+    }
+    sources
+}
+
+fn unmasked_component(pixel: u32, mask: u32) -> u8 {
+    if mask == 0 { return 0; }
+    let shift = mask.trailing_zeros();
+    let maximum = mask >> shift;
+    if maximum == 0 { return 0; }
+    let value = (pixel & mask) >> shift;
+    ((value * 255 + maximum / 2) / maximum).min(255) as u8
+}
+
+fn select_net_wm_icon(values: &[u32]) -> Option<RgbaImage> {
+    const TARGET: u32 = TASK_ICON_SIZE as u32;
+    let mut index = 0usize;
+    let mut best: Option<(u64, RgbaImage)> = None;
+    while index + 2 <= values.len() {
+        let width = values[index];
+        let height = values[index + 1];
+        index += 2;
+        let Some(pixel_count) = (width as usize).checked_mul(height as usize) else { break; };
+        let Some(end) = index.checked_add(pixel_count) else { break; };
+        if width == 0 || height == 0 || width > 1024 || height > 1024 || end > values.len() {
+            break;
+        }
+        let distance = (width as i64 - TARGET as i64).unsigned_abs()
+            + (height as i64 - TARGET as i64).unsigned_abs();
+        let undersized_penalty = if width >= TARGET && height >= TARGET { 0 } else { 10_000 };
+        let score = undersized_penalty + distance;
+        if best.as_ref().map_or(true, |(best_score, _)| score < *best_score) {
+            let mut bytes = Vec::with_capacity(pixel_count.saturating_mul(4));
+            for argb in &values[index..end] {
+                bytes.push(((argb >> 16) & 0xff) as u8);
+                bytes.push(((argb >> 8) & 0xff) as u8);
+                bytes.push((argb & 0xff) as u8);
+                bytes.push(((argb >> 24) & 0xff) as u8);
+            }
+            if let Some(image) = RgbaImage::from_raw(width, height, bytes) {
+                best = Some((score, image));
+            }
+        }
+        index = end;
+    }
+    best.map(|(_, image)| image)
+}
+
+fn rgba_to_x11_data(
+    conn: &RustConnection,
+    depth: u8,
+    visual_id: u32,
+    image: &RgbaImage,
+    backdrop: (u8, u8, u8),
+) -> Option<Vec<u8>> {
+    let setup = conn.setup();
+    let format = setup.pixmap_formats.iter().find(|format| format.depth == depth)?;
+    let visual = setup.roots.iter()
+        .flat_map(|screen| screen.allowed_depths.iter())
+        .flat_map(|allowed| allowed.visuals.iter())
+        .find(|visual| visual.visual_id == visual_id)?;
+    let bits_per_pixel = format.bits_per_pixel as u32;
+    let bytes_per_pixel = ((bits_per_pixel + 7) / 8) as usize;
+    let pad = format.scanline_pad as u32;
+    if bytes_per_pixel == 0 || pad == 0 { return None; }
+    let (width, height) = image.dimensions();
+    let line_bits = width.checked_mul(bits_per_pixel)?;
+    let stride = (((line_bits + pad - 1) / pad) * pad / 8) as usize;
+    let mut data = vec![0_u8; stride.checked_mul(height as usize)?];
+    let little_endian = setup.image_byte_order == x11rb::protocol::xproto::ImageOrder::LSB_FIRST;
+
+    for y in 0..height {
+        for x in 0..width {
+            let pixel = image.get_pixel(x, y).0;
+            let alpha = pixel[3] as u32;
+            let blend = |foreground: u8, background: u8| -> u8 {
+                ((foreground as u32 * alpha + background as u32 * (255 - alpha) + 127) / 255) as u8
+            };
+            let value = masked_component(blend(pixel[0], backdrop.0), visual.red_mask)
+                | masked_component(blend(pixel[1], backdrop.1), visual.green_mask)
+                | masked_component(blend(pixel[2], backdrop.2), visual.blue_mask);
+            let offset = y as usize * stride + x as usize * bytes_per_pixel;
+            for byte in 0..bytes_per_pixel {
+                let shift = if little_endian { byte * 8 } else { (bytes_per_pixel - byte - 1) * 8 };
+                data[offset + byte] = ((value >> shift) & 0xff) as u8;
+            }
+        }
+    }
+    Some(data)
+}
+
 fn masked_component(channel: u8, mask: u32) -> u32 {
     if mask == 0 { return 0; }
     let shift = mask.trailing_zeros();
@@ -2302,8 +3357,8 @@ fn allocate_palette(
         Palette {
             panel: color(0xe3e3e3)?,
             surface: color(0xf5f5f5)?,
-            search: color(0xffffff)?,
-            search_text: color(0x4a4a4a)?,
+            search: color(0x2b2b2b)?,
+            search_text: color(0xf1f1f1)?,
             text: color(0x202020)?,
             muted: color(0x777777)?,
             accent: color(0x0078d7)?,
@@ -2313,8 +3368,8 @@ fn allocate_palette(
         Palette {
             panel: color(0x1f1f1f)?,
             surface: color(0x2d2d2d)?,
-            search: color(0x2b2b2b)?,
-            search_text: color(0xe2e2e2)?,
+            search: color(0xffffff)?,
+            search_text: color(0x202020)?,
             text: color(0xf1f1f1)?,
             muted: color(0xa0a0a0)?,
             accent: color(0x0078d7)?,
