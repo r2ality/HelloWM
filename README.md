@@ -1,6 +1,8 @@
 # HelloWM
 
-HelloWM is a deliberately small, floating-only X11 window manager written in Rust. It takes a few visual cues from Windows 10 and IceWM without trying to reproduce either desktop. It has one bottom taskbar, no workspace system, and no wallpaper manager.
+HelloWM is a deliberately small, floating-only X11 window manager written in Rust and Shell. mimicking Windows 10 mainly.
+
+Just for fun, not a serious WM, but usable and daily drivable.
 
 ## What is included
 
